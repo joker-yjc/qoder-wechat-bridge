@@ -11,6 +11,7 @@ import type {
   QrCodeResp,
   QrStatusResp,
   SendMessageResp,
+  UploadUrlResp,
   WeixinMessage,
 } from './types.js';
 import { MessageItemType, MessageState, MessageType, TypingStatus } from './types.js';
@@ -232,15 +233,15 @@ export async function getUpdates(params: {
 }
 
 /**
- * 发送一条纯文本消息
- * @param params - 目标用户、正文、context_token
+ * 发送单条消息项（官方约定 item_list 只放一个元素）
+ * @param params - 目标用户、消息项、context_token
  * @returns 服务端回执
  */
-export async function sendText(params: {
+export async function sendItem(params: {
   baseUrl: string;
   token: string;
   toUserId: string;
-  text: string;
+  item: unknown;
   contextToken: string;
 }): Promise<SendMessageResp> {
   const text = await postJson(
@@ -253,17 +254,81 @@ export async function sendText(params: {
         client_id: `qoder-bridge-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
         message_type: MessageType.BOT,
         message_state: MessageState.FINISH,
-        item_list: [{ type: MessageItemType.TEXT, text_item: { text: params.text } }],
+        item_list: [params.item],
         context_token: params.contextToken,
       },
       base_info: buildBaseInfo(),
     },
   );
   const resp = parseWeixinJson<SendMessageResp>(text);
+  log.debug('sendMessage 回执', {
+    ret: resp.ret,
+    errcode: resp.errcode,
+    errmsg: resp.errmsg,
+    messageId: resp.message_id,
+  });
   if (resp.ret && resp.ret !== 0) {
     throw new Error(`sendMessage ret=${resp.ret} errmsg=${resp.errmsg ?? '(none)'}`);
   }
+  if (resp.errcode && resp.errcode !== 0) {
+    throw new Error(`sendMessage errcode=${resp.errcode} errmsg=${resp.errmsg ?? '(none)'}`);
+  }
   return resp;
+}
+
+/**
+ * 发送一条纯文本消息
+ * @param params - 目标用户、正文、context_token
+ * @returns 服务端回执
+ */
+export async function sendText(params: {
+  baseUrl: string;
+  token: string;
+  toUserId: string;
+  text: string;
+  contextToken: string;
+}): Promise<SendMessageResp> {
+  return sendItem({
+    baseUrl: params.baseUrl,
+    token: params.token,
+    toUserId: params.toUserId,
+    contextToken: params.contextToken,
+    item: { type: MessageItemType.TEXT, text_item: { text: params.text } },
+  });
+}
+
+/**
+ * 申请媒体上传地址
+ * @param params - 文件元数据与目标用户
+ * @returns upload_param / upload_full_url
+ */
+export async function getUploadUrl(params: {
+  baseUrl: string;
+  token: string;
+  filekey: string;
+  mediaType: number;
+  toUserId: string;
+  rawsize: number;
+  rawfilemd5: string;
+  filesize: number;
+  aeskeyHex: string;
+}): Promise<UploadUrlResp> {
+  const text = await postJson(
+    { baseUrl: params.baseUrl, token: params.token, label: 'getUploadUrl', timeoutMs: 15_000 },
+    'ilink/bot/getuploadurl',
+    {
+      filekey: params.filekey,
+      media_type: params.mediaType,
+      to_user_id: params.toUserId,
+      rawsize: params.rawsize,
+      rawfilemd5: params.rawfilemd5,
+      filesize: params.filesize,
+      no_need_thumb: true,
+      aeskey: params.aeskeyHex,
+      base_info: buildBaseInfo(),
+    },
+  );
+  return JSON.parse(text) as UploadUrlResp;
 }
 
 /**
@@ -334,7 +399,9 @@ export async function notifyClient(params: { baseUrl: string; token: string; act
 }
 
 /**
- * 把消息项里的文本提取出来；非文本给占位说明
+ * 提取消息里的文本
+ * 图片/文件/视频由 media 模块下载后作为附件传给 Qoder；语音只取微信转写
+ * 没有转写的语音返回空串，由上层给出提示，避免把占位文本当成任务
  * @param msg - 微信消息
  * @returns 归一化文本
  */
@@ -344,14 +411,8 @@ export function extractText(msg: WeixinMessage): string {
     if (item.type === MessageItemType.TEXT && item.text_item?.text) {
       if (item.ref_msg?.title) parts.push(`[引用] ${item.ref_msg.title}`);
       parts.push(item.text_item.text);
-    } else if (item.type === MessageItemType.IMAGE) {
-      parts.push('[图片：v1 暂不支持图片任务]');
-    } else if (item.type === MessageItemType.VOICE) {
-      parts.push(item.voice_item?.text ? item.voice_item.text : '[语音：v1 暂不支持]');
-    } else if (item.type === MessageItemType.FILE) {
-      parts.push(`[文件：${item.file_item?.file_name ?? '未命名'}，v1 暂不支持]`);
-    } else if (item.type === MessageItemType.VIDEO) {
-      parts.push('[视频：v1 暂不支持]');
+    } else if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
+      parts.push(item.voice_item.text);
     }
   }
   return parts.join('\n').trim();

@@ -4,7 +4,7 @@
 
 适合"人不在电脑前，但想让电脑上的 Qoder 继续干活"的场景。
 
-> 当前版本 `0.2.0`：单聊文本 + 主动提醒。图片、文件、语音、进度气泡在路线图中。
+> 当前版本 `0.2.0`：单聊文本、主动提醒、双向图片/文件/视频、语音接收（平台转写）与语音发送（macOS 原型）。
 
 ---
 
@@ -130,6 +130,18 @@ qoder-wechat run
 2. 直接发一句话，比如：`列出当前目录下最近修改的三个文件`。
 3. 你会看到"正在输入"提示；任务完成后，结果会分条发回来。
 
+**发附件**：图片、文件、视频可以直接发给机器人，桥接会下载并解密，通过 `--attachment` 交给 Qoder（图片能直接识别内容）。多个附件、图文混发都支持，单文件上限 20MB。附件缓存在 `inboxDir`（默认 `~/.local/state/qoder-wechat-bridge/inbox/`），7 天后启动时自动清理。语音依赖微信平台的转写：有转写就按文字处理，没有转写会直接提示重发，不会启动任务。
+
+附件目录可以自己指定，也可以随时清理：
+
+```bash
+qoder-wechat run --inbox-dir ~/Pictures/qwb-inbox   # 换目录（也可写进配置 QWB_INBOX_DIR）
+qoder-wechat status                                  # 查看目录占用
+qoder-wechat clean                                   # 删除 7 天前的附件
+qoder-wechat clean --days 1                          # 只保留最近 1 天
+qoder-wechat clean --all                             # 全部删除
+```
+
 ### 内置命令
 
 不确定能发什么时，先发 `/help`：
@@ -159,6 +171,8 @@ qoder-wechat run
 ```
 
 **电脑重启、终端关闭、Ctrl+C 之后，都需要再执行一次。** 登录状态是保存的，不用重新扫码。
+
+Windows 下同样用 `qoder-wechat run`，或双击仓库里的 `启动桥接.cmd`；停止用 `Ctrl+C`。
 
 登录过期（日志里出现 `-14`）时，重新扫码即可：
 
@@ -220,9 +234,28 @@ qoder-wechat login                 # 扫码登录 / 换号
 qoder-wechat run                   # 启动服务（前台）
 qoder-wechat run --cwd ~/project   # 指定工作目录
 qoder-wechat notify "内容"          # 主动推一条提醒（窗口不可用时自动排队）
+qoder-wechat send-file shot.png    # 发图片/文件/视频（可选 --text "文案"）
+qoder-wechat send-voice "构建完成了"  # [实验性] 本机 TTS 语音（客户端可能不显示）
 qoder-wechat status                # 查看配置与会话
 qoder-wechat help                  # 帮助
 ```
+
+### 发送语音（实验性，暂不可用）
+
+```bash
+qoder-wechat send-voice "构建完成，有三个测试失败，需要你确认"
+```
+
+链路本身能跑通（`say → afconvert → silk-wasm → CDN`，服务端也返回 `messageId`），但实测把 `encode_type`、`sample_rate`、`bits_per_sample` 都对齐平台入站语音后，**微信客户端仍不渲染这条语音**。判断是这条官方机器人通道目前只支持入站语音、不支持出站语音。命令保留用于以后复测，不建议在实际流程中使用；需要发音频时请用 `send-file` 发音频文件。
+
+### 发送图片 / 文件
+
+```bash
+qoder-wechat send-file ~/Desktop/report.pdf --text "报告生成好了"
+qoder-wechat send-file ~/Desktop/chart.png
+```
+
+图片（png/jpg/gif/webp）会直接显示在聊天里，其它文件作为附件发送，mp4/mov 作为视频。单文件上限 10MB；文案和媒体会各占一条下行额度。需要最近一次入站留下的窗口，没有窗口时会直接报错——先给机器人发一句话再发文件。
 
 ### 主动提醒（notify）
 
@@ -256,6 +289,9 @@ qoder-wechat notify "构建完成，有 3 个测试失败，需要你确认是�
 | `permissionMode` | `QWB_PERMISSION_MODE` | `dont_ask` | `default` / `accept_edits` / `dont_ask` / `bypass_permissions` / `auto` |
 | `qoderBin` | `QWB_QODER_BIN` | `qodercli` | CLI 路径 |
 | `qoderModel` | `QWB_MODEL` | 空 | 默认模型 |
+| `memoryEnabled` | `QWB_MEMORY` | `true` | 是否加载 Qoder 长期记忆（`QODER_MEMORY_HEADLESS`） |
+| `personaFile` | `QWB_PERSONA_FILE` | `~/.config/qoder-wechat-bridge/persona.md` | 人设文件；存在时作为 `--append-system-prompt` |
+| `inboxDir` | `QWB_INBOX_DIR` | `~/.local/state/qoder-wechat-bridge/inbox` | 入站附件目录，可指向磁盘更宽裕的位置 |
 | `ownerUserId` | `QWB_OWNER_ID` | 登录时写入 | 唯一授权发送者 |
 | `allowFrom` | `QWB_ALLOW_FROM` | `[]` | 额外白名单，逗号分隔 |
 | `allowFirstSender` | `QWB_ALLOW_FIRST_SENDER` | `false` | 未设置授权人时是否信任首个发送者 |
@@ -264,6 +300,19 @@ qoder-wechat notify "构建完成，有 3 个测试失败，需要你确认是�
 | `maxRepliesPerTurn` | `QWB_MAX_REPLIES` | `9` | 单轮最多下行条数 |
 
 模型切换细节：内置模型直接写名字（如 `GLM-5.3`）；自定义 provider 的模型必须写成 `<providerId>/<model>`，否则 Qoder 会静默回落到 `auto`。`/model` 命令已处理这层映射。
+
+**记忆**：开启 `memoryEnabled` 后，headless 会话会读取 Qoder 的长期记忆（`~/.qoder/memory/MEMORY.md` 与当前工作目录对应的项目记忆），你在桌面端积累的偏好、项目背景会带进微信任务里。实现上只是给 `qodercli` 补回 `QODER_MEMORY_HEADLESS=1`——桥接为了避免 `sdk_worker_removed` 会剥离所有 `QODER_*`，唯独这个开关需要保留。关闭用 `QWB_MEMORY=0`。
+
+**人设（persona）**：把人设写进 `~/.config/qoder-wechat-bridge/persona.md`，每条任务会读取它并作为 `--append-system-prompt` 追加到 Qoder 默认提示后——工具、skill、记忆的说明都保留，只增加你的风格约束。改完保存，下一条微信消息就生效，不用重启。文件上限 8KB。
+
+```markdown
+你是「阿程」，一个通过微信远程协助的工程助手。
+- 回答简洁，先给结论，再给必要细节
+- 不确定就直说不确定，不要编造
+- 涉及删除、覆盖、推送等操作，先确认再执行
+```
+
+配置里也能改路径：`personaFile` 或 `QWB_PERSONA_FILE`。文件不存在时等于没设人设，不影响任何行为。
 
 作为库调用：
 
@@ -300,7 +349,8 @@ console.log(result.ok, result.text);
 - 仅单聊；官方通道 `groupPolicy: "disabled"`，不支持群聊。
 - 一次入站大约只有 **10 条下行额度**，`context_token` 约 **24 小时**时效（社区实测，官方未公布数值）。
 - `ret=0` 只代表接口受理，不保证送达；风控可能静默过滤。
-- 仅文本；图片 / 文件 / 语音 / 视频在 v0.2。
+- Windows 可用：收发、附件、通知等与 macOS 一致；登录二维码需手动打开 `~/.local/state/qoder-wechat-bridge/wechat-qr.png`。
+- 出站语音为实验性：协议字段已对齐，但微信客户端不渲染；发音频请用 `send-file`。
 - 任务在 CLI 侧执行，Qoder 桌面版历史里看不到。
 - v0.1 没有开机自启，重启后需要手动 `run`。
 

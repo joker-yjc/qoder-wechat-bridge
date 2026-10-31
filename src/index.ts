@@ -42,3 +42,8 @@ export { log, setLevel } from './log.js';
 
 export { notify, pendingFilePath, takePending } from './notify.js';
 export type { NotifyResult, PendingNotice } from './notify.js';
+
+export { loadPersona, MAX_PERSONA_BYTES } from './persona.js';
+
+export { sendMediaFile, sendVoiceFromText } from './weixin/send-media.js';
+export type { MediaKind, SendMediaResult, SendVoiceResult } from './weixin/send-media.js';

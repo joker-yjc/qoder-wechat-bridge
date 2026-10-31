@@ -1,0 +1,4 @@
+# 平台相关的行尾约定
+*.cmd text eol=crlf
+*.command text eol=lf
+*.sh text eol=lf

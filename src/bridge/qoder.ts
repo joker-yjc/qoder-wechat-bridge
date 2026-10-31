@@ -2,7 +2,7 @@
  * Qoder agent 调用层：通过 qodercli headless 执行一次任务
  * @module bridge/qoder
  */
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import os from 'node:os';
 import { log } from '../log.js';
 
@@ -17,6 +17,12 @@ export interface QoderRunInput {
   bin: string;
   permissionMode: string;
   model?: string;
+  /** 是否加载 Qoder 长期记忆（默认 false，由调用方显式开启） */
+  memory?: boolean;
+  /** 追加到默认 system prompt 的人设文本 */
+  appendSystemPrompt?: string;
+  /** 随任务附带的本地文件路径（--attachment） */
+  attachments?: string[];
 }
 
 /** 一次调用的结果 */
@@ -36,15 +42,18 @@ const MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 /**
  * 构造干净的环境变量
  * 关键：从 Qoder Desktop 的 shell 启动时，继承的 QODER_* 会让 qodercli 误判为 SDK worker
+ * 记忆开关 QODER_MEMORY_HEADLESS 是唯一需要补回来的一个
+ * @param opts - memory=true 时打开 headless 长期记忆
  * @returns 清理后的环境变量
  */
-export function cleanEnv(): NodeJS.ProcessEnv {
+export function cleanEnv(opts: { memory?: boolean } = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {
     if (key.startsWith('QODER_') || key === 'CLAUDECODE' || key.startsWith('CLAUDE_CODE_')) {
       delete env[key];
     }
   }
+  if (opts.memory) env.QODER_MEMORY_HEADLESS = '1';
   return env;
 }
 
@@ -84,17 +93,23 @@ function parseResult(raw: string): { result?: string; is_error?: boolean; sessio
 export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
   const startedAt = Date.now();
   const args = ['-p', '-o', 'json', '--permission-mode', input.permissionMode];
+  if (input.appendSystemPrompt?.trim()) {
+    args.push('--append-system-prompt', input.appendSystemPrompt.trim());
+  }
   const workdir = input.cwd?.trim() || os.homedir();
   // 不限定目录时不传 -w，让 qodercli 以全局会话方式运行
   if (input.cwd?.trim()) args.push('-w', input.cwd.trim());
   if (input.model) args.push('-m', input.model);
   if (input.sessionId) args.push('-r', input.sessionId);
+  for (const file of input.attachments ?? []) {
+    args.push('--attachment', file);
+  }
   args.push(input.prompt);
 
   return new Promise((resolve) => {
     const child = spawn(input.bin, args, {
       cwd: workdir,
-      env: cleanEnv(),
+      env: cleanEnv({ memory: input.memory }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -106,10 +121,10 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
       child.kill('SIGKILL');
     }, input.timeoutMs);
 
-    child.stdout.on('data', (buf: Buffer) => {
+    child.stdout?.on('data', (buf: Buffer) => {
       if (stdout.length < MAX_OUTPUT_BYTES) stdout += buf.toString('utf-8');
     });
-    child.stderr.on('data', (buf: Buffer) => {
+    child.stderr?.on('data', (buf: Buffer) => {
       if (stderr.length < MAX_OUTPUT_BYTES) stderr += buf.toString('utf-8');
     });
     child.on('error', (err) => {

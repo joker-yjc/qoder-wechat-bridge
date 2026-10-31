@@ -40,7 +40,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "build": "tsc -p tsconfig.json && node scripts/postbuild.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "login": "npm run build && node dist/cli.js login",
     "start": "npm run build && node dist/cli.js run",
@@ -48,10 +48,13 @@
     "prepublishOnly": "npm run typecheck && npm run build && node scripts/check-publish.mjs"
   },
   "dependencies": {
+    "cross-spawn": "^7.0.6",
     "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "silk-wasm": "^3.7.1"
   },
   "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.9.0",
     "@types/qrcode": "^1.5.5",
     "@types/qrcode-terminal": "^0.12.2",

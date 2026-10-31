@@ -57,6 +57,14 @@ export interface Config {
   qoderBin: string;
   /** 可选模型名，空串表示用 Qoder 默认 */
   qoderModel: string;
+  /** 是否在 Qoder 会话中加载长期记忆（QODER_MEMORY_HEADLESS） */
+  memoryEnabled: boolean;
+  /** 人设文件路径；文件存在时作为 --append-system-prompt 传入 */
+  personaFile: string;
+  /** 入站附件存放目录；默认在状态目录下，可指向磁盘更宽裕的位置 */
+  inboxDir: string;
+  /** 语音合成发音人（macOS say） */
+  ttsVoice: string;
   /** 单个任务最长执行时间 */
   qoderTimeoutMs: number;
   /** typing 保活间隔 */
@@ -81,6 +89,10 @@ export const DEFAULT_CONFIG: Config = {
   permissionMode: 'dont_ask',
   qoderBin: 'qodercli',
   qoderModel: '',
+  memoryEnabled: true,
+  personaFile: path.join(configDir(), 'persona.md'),
+  inboxDir: path.join(stateDir(), 'inbox'),
+  ttsVoice: 'Tingting',
   qoderTimeoutMs: 10 * 60_000,
   typingKeepAliveMs: 5_000,
   maxReplyChars: 2_000,
@@ -100,6 +112,10 @@ const ENV_OVERRIDES: ReadonlyArray<[keyof Config, string, (raw: string) => unkno
   ['permissionMode', 'QWB_PERMISSION_MODE', (v) => v],
   ['qoderBin', 'QWB_QODER_BIN', (v) => v],
   ['qoderModel', 'QWB_MODEL', (v) => v],
+  ['memoryEnabled', 'QWB_MEMORY', (v) => !['0', 'false', 'no', 'off'].includes(v.toLowerCase())],
+  ['personaFile', 'QWB_PERSONA_FILE', (v) => v],
+  ['inboxDir', 'QWB_INBOX_DIR', (v) => v],
+  ['ttsVoice', 'QWB_TTS_VOICE', (v) => v],
   ['qoderTimeoutMs', 'QWB_TIMEOUT_MS', (v) => Number(v)],
   ['maxReplyChars', 'QWB_MAX_REPLY_CHARS', (v) => Number(v)],
   ['maxRepliesPerTurn', 'QWB_MAX_REPLIES', (v) => Number(v)],

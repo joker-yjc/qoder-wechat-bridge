@@ -17,10 +17,12 @@ import {
   sendTyping,
   SESSION_EXPIRED_ERRCODE,
 } from '../weixin/client.js';
-import { MessageType, TypingStatus, type WeixinMessage } from '../weixin/types.js';
+import { MessageItemType, MessageType, TypingStatus, type MessageItem, type WeixinMessage } from '../weixin/types.js';
+import { downloadItemMedia, pruneInbox, type SavedMedia } from '../weixin/media.js';
 import { runQoder } from './qoder.js';
 import { chunkText } from './reply.js';
 import { takePending } from '../notify.js';
+import { loadPersona } from '../persona.js';
 
 /** 桥接服务句柄 */
 export interface BridgeHandle {
@@ -28,6 +30,38 @@ export interface BridgeHandle {
   stop: () => void;
   /** 当前生效配置 */
   config: Config;
+}
+
+/**
+ * 描述一个媒体项，用于失败提示
+ * @param item - 消息项
+ * @returns 描述文本
+ */
+function describeItem(item: MessageItem): string {
+  if (item.type === MessageItemType.IMAGE) return '图片';
+  if (item.type === MessageItemType.VIDEO) return '视频';
+  if (item.type === MessageItemType.VOICE) return '语音';
+  if (item.type === MessageItemType.FILE) return `文件「${item.file_item?.file_name ?? '未命名'}」`;
+  return '附件';
+}
+
+/**
+ * 把文本与附件说明拼成给 Qoder 的任务描述
+ * @param text - 用户文本
+ * @param media - 已下载附件
+ * @param failures - 下载失败的附件
+ * @returns 最终 prompt
+ */
+function buildPrompt(text: string, media: SavedMedia[], failures: string[]): string {
+  const notes: string[] = [];
+  if (media.length > 0) {
+    const list = media.map((m) => `- ${m.name}（${m.kind}，${Math.round(m.bytes / 1024)}KB）`).join('\n');
+    notes.push(`用户发来 ${media.length} 个附件，已作为附件提供：\n${list}`);
+  }
+  if (failures.length > 0) {
+    notes.push(`部分附件无法读取：${failures.join('；')}`);
+  }
+  return [text, ...notes].filter(Boolean).join('\n\n').trim();
 }
 
 /**
@@ -39,6 +73,11 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
   ensureDirs();
   let config: Config = { ...loadConfig(), ...overrides };
   const state: State = loadState();
+  try {
+    pruneInbox(config.inboxDir);
+  } catch {
+    // 清理失败不影响启动
+  }
   let running = true;
   /** 用于中断长轮询，保证 Ctrl+C 后立即退出 */
   const abortController = new AbortController();
@@ -160,7 +199,12 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
    * @param text - 任务文本
    * @param contextToken - 本次入站的上下文令牌
    */
-  const processTask = async (userId: string, text: string, contextToken: string): Promise<void> => {
+  const processTask = async (
+    userId: string,
+    text: string,
+    contextToken: string,
+    attachments: string[] = [],
+  ): Promise<void> => {
     let budget = config.maxRepliesPerTurn;
     const typing = new TypingKeeper(userId, contextToken);
     await typing.start();
@@ -262,11 +306,14 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
       // 4. 调 Qoder
       const record = state.sessions[userId];
       const modelForTask = state.models[userId] ?? config.qoderModel;
+      // 每条任务重新读取人设，改文件后下一条消息即生效
+      const persona = loadPersona(config.personaFile);
       log.info('开始执行 Qoder 任务', {
         userId,
         sessionId: record?.sessionId ?? '(new)',
         cwd: workdir(),
         model: modelForTask || '(default)',
+        personaChars: persona.length,
       });
       let result = await runQoder({
         prompt: text,
@@ -276,6 +323,9 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
         bin: config.qoderBin,
         permissionMode: config.permissionMode,
         model: modelForTask || undefined,
+        memory: config.memoryEnabled,
+        appendSystemPrompt: persona || undefined,
+        attachments,
       });
       // 会话不可续接时降级为新会话重试一次
       if (!result.ok && record?.sessionId && /session|resume|not found/i.test(result.error ?? '')) {
@@ -287,6 +337,9 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
           bin: config.qoderBin,
           permissionMode: config.permissionMode,
           model: modelForTask || undefined,
+          memory: config.memoryEnabled,
+          appendSystemPrompt: persona || undefined,
+          attachments,
         });
       }
 
@@ -356,28 +409,117 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
     if (state.seenMessageIds.length > 500) state.seenMessageIds.splice(0, state.seenMessageIds.length - 500);
     persistState();
 
+    // 诊断：只记录字段是否存在，不落音频内容
+    log.debug('入站消息项', {
+      messageId: msgId,
+      items: (msg.item_list ?? []).map((item) => ({
+        type: item.type,
+        text: Boolean(item.text_item?.text),
+        voiceText: Boolean(item.voice_item?.text),
+        voicePlaytime: item.voice_item?.playtime ?? null,
+        hasMedia: Boolean(
+          item.image_item?.media || item.voice_item?.media || item.file_item?.media || item.video_item?.media,
+        ),
+        hasAesKey: Boolean(
+          item.image_item?.media?.aes_key ||
+            item.voice_item?.media?.aes_key ||
+            item.file_item?.media?.aes_key ||
+            item.video_item?.media?.aes_key,
+        ),
+        fileName: item.file_item?.file_name ?? null,
+        voiceMeta: item.voice_item
+          ? {
+              encode_type: item.voice_item.encode_type ?? null,
+              bits_per_sample: item.voice_item.bits_per_sample ?? null,
+              sample_rate: item.voice_item.sample_rate ?? null,
+              playtime: item.voice_item.playtime ?? null,
+              textLen: item.voice_item.text?.length ?? 0,
+            }
+          : null,
+      })),
+    });
+
     const text = extractText(msg);
-    if (!text) {
-      log.info('消息无文本内容，跳过', { from });
-      return;
-    }
+
+    // 先鉴权，再下载附件，避免未授权者消耗带宽和磁盘
     if (!isAllowed(from)) {
       if (config.allowFirstSender) {
         config = { ...config, ownerUserId: from };
         saveConfig({ ...config });
         log.warn('allowFirstSender 生效，已把首个发送者设为授权账号', { from });
       } else {
-        log.warn('未授权的发送者，已忽略', { from, preview: text.slice(0, 40) });
+        log.warn('未授权的发送者，已忽略', { from, preview: text.slice(0, 40) || '[附件]' });
         return;
       }
     }
+
     const contextToken = msg.context_token ?? '';
     if (contextToken) {
       state.contextTokens[from] = contextToken;
       persistState();
     }
-    log.info('收到授权消息', { from, chars: text.length, preview: text.slice(0, 60) });
-    enqueue(from, () => processTask(from, text, contextToken));
+
+    // 语音没有转写时给用户明确反馈，不启动 Qoder 任务
+    const voiceWithoutText = (msg.item_list ?? []).some(
+      (item) => item.type === MessageItemType.VOICE && !item.voice_item?.text,
+    );
+
+    // 下载图片/文件/视频，落盘后通过 --attachment 交给 Qoder
+    const media: SavedMedia[] = [];
+    const failures: string[] = [];
+    let mediaIndex = 0;
+    for (const item of msg.item_list ?? []) {
+      const isMedia =
+        item.type === MessageItemType.IMAGE ||
+        item.type === MessageItemType.FILE ||
+        item.type === MessageItemType.VIDEO ||
+        // 无转写的语音也下载，便于诊断/未来接 ASR；有转写的不下载
+        (item.type === MessageItemType.VOICE && !item.voice_item?.text);
+      if (!isMedia) continue;
+      mediaIndex += 1;
+      try {
+        const saved = await downloadItemMedia(item, msgId, mediaIndex, config.inboxDir);
+        if (saved) media.push(saved);
+        else failures.push(describeItem(item));
+      } catch (err) {
+        log.warn('附件下载失败', { messageId: msgId, error: String(err) });
+        failures.push(`${describeItem(item)}（${String(err).slice(0, 80)}）`);
+      }
+    }
+
+    // 语音文件只做诊断，不作为附件交给 Qoder
+    const attachments = media.filter((m) => m.kind !== 'voice').map((m) => m.path);
+    const voiceFiles = media.filter((m) => m.kind === 'voice');
+    if (voiceFiles.length > 0) {
+      log.info('已保存未转写语音，供诊断', { count: voiceFiles.length, path: voiceFiles[0]?.path });
+    }
+
+    // 语音没有转写且没有其它内容：直接反馈，不启动任务
+    if (voiceWithoutText && !text && attachments.length === 0) {
+      log.info('语音无转写，已直接反馈', { from });
+      if (contextToken) {
+        await deliver(from, contextToken, '这条语音没有转写，我没法听到内容。请重发一次，或改用文字/图片。');
+      }
+      return;
+    }
+    if (voiceWithoutText) failures.push('语音（无转写）');
+
+    const prompt = buildPrompt(
+      text,
+      media.filter((m) => m.kind !== 'voice'),
+      failures,
+    );
+    if (!prompt) {
+      log.info('消息无可用内容，跳过', { from });
+      return;
+    }
+    log.info('收到授权消息', {
+      from,
+      chars: text.length,
+      attachments: media.length,
+      preview: text.slice(0, 60),
+    });
+    enqueue(from, () => processTask(from, prompt, contextToken, attachments));
   };
 
   /** 主循环 */

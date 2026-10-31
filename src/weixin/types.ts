@@ -24,20 +24,35 @@ export const MessageState = { NEW: 0, GENERATING: 1, FINISH: 2 } as const;
 /** typing 状态：1=正在输入，2=取消 */
 export const TypingStatus = { TYPING: 1, CANCEL: 2 } as const;
 
+/** 上传媒体类型：getuploadurl 的 media_type */
+export const UploadMediaType = { IMAGE: 1, VIDEO: 2, FILE: 3, VOICE: 4 } as const;
+
 /** 媒体引用（图片/文件/语音/视频共用） */
 export interface MediaRef {
   encrypt_query_param?: string;
   aes_key?: string;
+  /** 服务端直接给出的完整下载地址，优先使用 */
+  full_url?: string;
+  encrypt_type?: number;
 }
 
 /** 消息项 */
 export interface MessageItem {
   type: number;
   text_item?: { text?: string };
-  image_item?: { media?: MediaRef; url?: string };
-  voice_item?: { text?: string; media?: MediaRef };
-  file_item?: { file_name?: string; len?: number; media?: MediaRef };
-  video_item?: { media?: MediaRef };
+  image_item?: { media?: MediaRef; url?: string; aeskey?: string; mid_size?: number };
+  voice_item?: {
+    text?: string;
+    media?: MediaRef;
+    playtime?: number;
+    /** 编码标识：6 = silk */
+    encode_type?: number;
+    bits_per_sample?: number;
+    /** 采样率 Hz */
+    sample_rate?: number;
+  };
+  file_item?: { file_name?: string; len?: number | string; media?: MediaRef };
+  video_item?: { media?: MediaRef; playtime?: number; video_size?: number };
   /** 被引用的原消息 */
   ref_msg?: { title?: string; message_item?: MessageItem };
 }
@@ -106,4 +121,13 @@ export interface GetConfigResp {
   errcode?: number;
   errmsg?: string;
   typing_ticket?: string;
+}
+
+/** getuploadurl 响应 */
+export interface UploadUrlResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  upload_param?: string;
+  upload_full_url?: string;
 }

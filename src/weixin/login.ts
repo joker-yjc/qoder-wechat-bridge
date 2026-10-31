@@ -32,7 +32,18 @@ export interface LoginResult {
 }
 
 /**
- * 展示二维码：终端 ASCII + PNG 留档 + macOS 预览
+ * 用系统默认方式打开文件（macOS / Windows / Linux）
+ * @param filePath - 文件路径
+ */
+function openFile(filePath: string): void {
+  const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer.exe' : 'xdg-open';
+  execFile(opener, [filePath], (err) => {
+    if (err) log.debug('自动打开二维码失败（可手动打开）', { filePath, error: String(err) });
+  });
+}
+
+/**
+ * 展示二维码：终端 ASCII + PNG 留档 + 系统默认应用打开
  * @param content - 二维码内容
  * @param asciiSmall - 终端是否用紧凑模式
  */
@@ -42,12 +53,7 @@ async function showQr(content: string, asciiSmall = true): Promise<void> {
   const png = path.join(stateDir(), 'wechat-qr.png');
   await QRCode.toFile(png, content, { width: 560, margin: 2 });
   log.info('二维码已生成', { content, png: `QR_IMAGE:${png}` });
-  if (process.platform === 'darwin') {
-    // 固定参数、无 shell，避免命令拼接
-    execFile('open', [png], (err) => {
-      if (err) log.debug('自动打开二维码失败（可手动打开）', { png, error: String(err) });
-    });
-  }
+  openFile(png);
 }
 
 /**

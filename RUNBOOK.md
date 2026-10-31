@@ -17,10 +17,12 @@
 | 用途 | 路径 |
 |---|---|
 | 配置（含 token，600） | `~/.config/qoder-wechat-bridge/config.json` |
+| 人设文件（可选） | `~/.config/qoder-wechat-bridge/persona.md` |
 | 状态（游标、会话映射、补发队列） | `~/.local/state/qoder-wechat-bridge/state.json` |
 | 待补发提醒（notify 排队） | `~/.local/state/qoder-wechat-bridge/pending-notifications.jsonl` |
 | 日志 | `~/.local/state/qoder-wechat-bridge/logs/bridge-YYYY-MM-DD.jsonl` |
 | 登录二维码 | `~/.local/state/qoder-wechat-bridge/wechat-qr.png` |
+| 入站附件缓存（7 天） | `~/.local/state/qoder-wechat-bridge/inbox/` |
 | 无 TTY 时的校验码 | `~/.local/state/qoder-wechat-bridge/verify-code.txt` |
 
 ## 3. 启动 / 停止
@@ -36,12 +38,41 @@ node dist/cli.js run --cwd ~/projects/my-app
 
 停止：`Ctrl+C`。
 
+### Windows
+
+```bat
+cd /d <项目目录>
+启动桥接.cmd            rem 双击也可以
+node dist\cli.js run    rem 或直接前台运行
+```
+
+停止（前台 `Ctrl+C`；后台运行时）：
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like "*dist\cli.js run*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+日志与进程：
+
+```powershell
+Get-Content "$env:USERPROFILE\.local\state\qoder-wechat-bridge\logs\bridge-$(Get-Date -Format yyyy-MM-dd).jsonl" -Tail 20
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*dist\cli.js run*" }
+```
+
+> Windows 下配置文件在 `%USERPROFILE%\.config\qoder-wechat-bridge\`，状态与附件在 `%USERPROFILE%\.local\state\qoder-wechat-bridge\`（沿用 XDG 目录，功能正常，只是不符合 Windows 惯例）。
+
 ## 4. 常用命令
 
 ```bash
 node dist/cli.js status                      # 查看配置与会话
 node dist/cli.js login                       # 重新扫码（token 过期/换号）
 node dist/cli.js notify "需要你确认一下"       # 主动提醒（无窗口时排队）
+node dist/cli.js send-file ./chart.png        # 发图片/文件/视频（≤10MB）
+node dist/cli.js send-voice "构建完成了"       # [实验性] 语音，客户端可能不显示；发音频请用 send-file
+node dist/cli.js clean [--days N|--all]       # 清理入站附件（默认 7 天前）
+node dist/cli.js run --inbox-dir ~/qwb-inbox  # 自定义附件目录
 node dist/cli.js run --permission-mode dont_ask
 ```
 
@@ -58,6 +89,7 @@ node dist/cli.js run --permission-mode dont_ask
 | `SyntaxError: Invalid regular expression flags` | node 仍是 v16 | `n 22` |
 | 扫码后 `binded_redirect` | 该微信号已绑过其它 OpenClaw 形态机器人 | 先解绑，或换号 |
 | 收消息正常但回复失败 `ret=-2` | context_token 过期 / 下行额度耗尽 | 属通道限制；结果会进补发队列，下次入站重试 |
+| 语音只收到"没有转写"的提示 | 平台未提供该条语音的转写 | 让用户重发或改用文字；要 100% 覆盖需接 ASR |
 | 日志 `-14` | 微信会话过期 | 重新 `login`；不要高频重登（会触发风控） |
 | `npm error EACCES ~/.npm/_cacache` | 缓存目录有 root 所有的文件 | 用 `--cache ./.npm-cache`，或自行修复缓存权限 |
 | `install-scripts` 拦截 esbuild | npm 11 默认禁止 postinstall | 本项目不依赖 tsx/esbuild，用 `tsc` 构建即可 |
