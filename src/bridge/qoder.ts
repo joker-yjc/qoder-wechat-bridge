@@ -23,6 +23,8 @@ export interface QoderRunInput {
   appendSystemPrompt?: string;
   /** 随任务附带的本地文件路径（--attachment） */
   attachments?: string[];
+  /** 子进程启动后回调一个取消函数，用于 /stop */
+  onStart?: (cancel: () => void) => void;
 }
 
 /** 一次调用的结果 */
@@ -111,6 +113,9 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
       cwd: workdir,
       env: cleanEnv({ memory: input.memory }),
       stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    input.onStart?.(() => {
+      if (!child.killed) child.kill('SIGKILL');
     });
     let stdout = '';
     let stderr = '';

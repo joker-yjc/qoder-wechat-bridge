@@ -76,7 +76,7 @@ node dist/cli.js run --inbox-dir ~/qwb-inbox  # 自定义附件目录
 node dist/cli.js run --permission-mode dont_ask
 ```
 
-微信内置命令：`/help`（命令总览）、`/status`、`/reset`、`/model`（列出模型）、`/model <序号|名称>`（切换）、`/model default`（恢复 Auto）。
+微信内置命令：`/help`（命令总览）、`/status`、`/reset`、`/stop`（停止当前任务）、`/model`（列出模型）、`/model <序号|名称>`（切换）、`/model default`（恢复 Auto）。
 
 > 自定义 provider 的模型必须写成 `<providerId>/<model>`（如 `qoder-custom-xxxx/glm-5.3`），只写短名会被 Qoder 静默回落到 `auto`；`/model` 内部已做这层映射。
 

@@ -83,6 +83,8 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
   const abortController = new AbortController();
   /** 每个微信用户一条串行队列，避免同一会话并发 */
   const queues = new Map<string, Promise<void>>();
+  /** 每个用户当前正在执行的任务句柄，用于 /stop 强制停止 */
+  const runningTasks = new Map<string, { cancel: () => void; cancelled: boolean }>();
 
   /** 持久化状态 */
   const persistState = (): void => {
@@ -308,6 +310,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
       const modelForTask = state.models[userId] ?? config.qoderModel;
       // 每条任务重新读取人设，改文件后下一条消息即生效
       const persona = loadPersona(config.personaFile);
+      let taskHandle: { cancel: () => void; cancelled: boolean } | undefined;
       log.info('开始执行 Qoder 任务', {
         userId,
         sessionId: record?.sessionId ?? '(new)',
@@ -326,7 +329,20 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
         memory: config.memoryEnabled,
         appendSystemPrompt: persona || undefined,
         attachments,
+        onStart: (cancel) => {
+          taskHandle = { cancel, cancelled: false };
+          runningTasks.set(userId, taskHandle);
+        },
       });
+
+      // 用户通过 /stop 主动终止
+      if (taskHandle?.cancelled) {
+        log.info('任务已被用户停止', { userId });
+        runningTasks.delete(userId);
+        await deliver(userId, contextToken, '任务已停止。');
+        return;
+      }
+
       // 会话不可续接时降级为新会话重试一次
       if (!result.ok && record?.sessionId && /session|resume|not found/i.test(result.error ?? '')) {
         log.warn('续接会话失败，改为新建会话重试', { error: result.error });
@@ -340,6 +356,10 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
           memory: config.memoryEnabled,
           appendSystemPrompt: persona || undefined,
           attachments,
+          onStart: (cancel) => {
+            taskHandle = { cancel, cancelled: false };
+            runningTasks.set(userId, taskHandle);
+          },
         });
       }
 
@@ -391,6 +411,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
         log.warn('超出本轮额度，剩余内容进入补发队列', { count: remaining.length });
       }
     } finally {
+      runningTasks.delete(userId);
       await typing.stop();
     }
   };
@@ -463,6 +484,25 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
     const voiceWithoutText = (msg.item_list ?? []).some(
       (item) => item.type === MessageItemType.VOICE && !item.voice_item?.text,
     );
+
+    // /stop 必须在入队前处理，否则会排在正在运行的任务后面
+    const commandText = text.trim().toLowerCase();
+    if (commandText === '/stop' || commandText === '/cancel') {
+      const stopToken = msg.context_token ?? '';
+      if (stopToken) {
+        state.contextTokens[from] = stopToken;
+        persistState();
+      }
+      const handle = runningTasks.get(from);
+      if (handle) {
+        handle.cancelled = true;
+        handle.cancel();
+        log.info('收到停止指令，正在终止任务', { from });
+      } else if (stopToken) {
+        await deliver(from, stopToken, '当前没有正在执行的任务。');
+      }
+      return;
+    }
 
     // 下载图片/文件/视频，落盘后通过 --attachment 交给 Qoder
     const media: SavedMedia[] = [];

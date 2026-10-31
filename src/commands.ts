@@ -24,6 +24,7 @@ export const COMMANDS: readonly CommandDef[] = [
     description: '列出可用模型；带参数则切换，default 恢复 Auto',
   },
   { name: '/reset', usage: '/reset', description: '清空当前会话上下文' },
+  { name: '/stop', usage: '/stop', description: '强制停止当前正在执行的任务' },
 ];
 
 /**

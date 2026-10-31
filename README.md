@@ -155,6 +155,7 @@ qoder-wechat clean --all                             # 全部删除
 | `/model [my-provider] glm-5.3` | 按名称切换模型 |
 | `/model default` | 恢复默认模型（Auto） |
 | `/reset` | 清空当前对话上下文，重新开始 |
+| `/stop` | 强制停止当前正在执行的任务（`/cancel` 同义） |
 
 其余任何内容都会当成任务交给 Qoder。
 
