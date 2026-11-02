@@ -16,6 +16,14 @@
   ],
   "license": "MIT",
   "author": "joke_yao",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joker-yjc/qoder-wechat-bridge.git"
+  },
+  "homepage": "https://github.com/joker-yjc/qoder-wechat-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/joker-yjc/qoder-wechat-bridge/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=20"
