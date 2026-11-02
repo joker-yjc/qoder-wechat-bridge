@@ -43,8 +43,8 @@ function write(level: Level, msg: string, fields?: Record<string, unknown>): voi
   if (level === 'error' || level === 'warn') console.error(line);
   else console.log(line);
   try {
-    fs.mkdirSync(path.dirname(logFile()), { recursive: true });
-    fs.appendFileSync(logFile(), JSON.stringify(record) + '\n', 'utf-8');
+    fs.mkdirSync(path.dirname(logFile()), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(logFile(), JSON.stringify(record) + '\n', { encoding: 'utf-8', mode: 0o600 });
   } catch {
     // 日志落盘失败不影响主流程
   }
