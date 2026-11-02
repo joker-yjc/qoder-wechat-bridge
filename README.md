@@ -209,7 +209,7 @@ rm ~/.local/state/qoder-wechat-bridge/state.json
 **发了消息没反应？**
 
 ```bash
-pgrep -fl "dist/cli.js run"                                      # 服务还在吗
+pgrep -fl "qoder-wechat run|cli.js run"                         # 服务还在吗
 tail -20 ~/.local/state/qoder-wechat-bridge/logs/bridge-$(date +%F).jsonl   # 最近日志
 qoder-wechat status                                              # 登录状态
 ```
