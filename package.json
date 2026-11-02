@@ -1,6 +1,6 @@
 {
   "name": "@jcyao/qoder-wechat-bridge",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Bridge personal WeChat (iLink/OpenClaw official channel) to a local Qoder agent session.",
   "keywords": [
     "qoder",
