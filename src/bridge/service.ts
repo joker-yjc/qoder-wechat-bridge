@@ -2,7 +2,17 @@
  * 桥接服务编排：收消息 → 授权 → 串行队列 → Qoder → 分片回传
  * @module bridge/service
  */
-import { ensureDirs, loadConfig, loadState, saveConfig, saveState, type Config, type State } from '../config.js';
+import {
+  clearRunInfo,
+  ensureDirs,
+  loadConfig,
+  loadState,
+  saveConfig,
+  saveState,
+  writeRunInfo,
+  type Config,
+  type State,
+} from '../config.js';
 import os from 'node:os';
 import { log } from '../log.js';
 import { listModels, resolveModel, formatModelList } from '../models.js';
@@ -623,20 +633,46 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
     ownerUserId: config.ownerUserId || '(未设置)',
     token: config.token ? '***' : '(empty)',
   });
+  writeRunInfo();
 
-  const onStop = (): void => {
+  /**
+   * 取消所有进行中的 Qoder 任务
+   *
+   * 长轮询的 abortController 管不到子进程，不显式取消的话父进程退出后
+   * qodercli 会变成孤儿继续执行，跑完还可能往微信回消息。
+   */
+  const cancelAllTasks = (): void => {
+    for (const task of runningTasks.values()) {
+      task.cancelled = true;
+      task.cancel();
+    }
+  };
+
+  let signalCount = 0;
+  const onSignal = (): void => {
+    signalCount += 1;
+    if (signalCount > 1) {
+      log.warn('再次收到停止信号，立即退出');
+      persistState();
+      process.exit(130);
+    }
     log.info('收到停止信号，准备退出');
     running = false;
+    cancelAllTasks();
     abortController.abort();
     persistState();
   };
-  process.once('SIGINT', onStop);
-  process.once('SIGTERM', onStop);
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 
-  void runLoop().catch((err) => log.error('主循环异常退出', { error: String(err) }));
+  void runLoop()
+    .catch((err) => log.error('主循环异常退出', { error: String(err) }))
+    .finally(() => clearRunInfo(process.pid));
+
   return {
     stop: (): void => {
       running = false;
+      cancelAllTasks();
       abortController.abort();
     },
     config,

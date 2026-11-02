@@ -5,18 +5,22 @@
 export {
   DEFAULT_CONFIG,
   DEFAULT_STATE,
+  clearRunInfo,
   configDir,
   configPath,
   ensureDirs,
   loadConfig,
   loadState,
   migrateLegacyConfig,
+  readRunInfo,
+  runInfoPath,
   saveConfig,
   saveState,
   stateDir,
   statePath,
+  writeRunInfo,
 } from './config.js';
-export type { Config, OutboxItem, SessionRecord, State } from './config.js';
+export type { Config, OutboxItem, RunInfo, SessionRecord, State } from './config.js';
 
 export { login } from './weixin/login.js';
 export type { LoginResult } from './weixin/login.js';
@@ -25,6 +29,9 @@ export type { LoginResult } from './weixin/login.js';
 export * as weixin from './weixin/client.js';
 /** iLink 协议类型与常量 */
 export * as protocol from './weixin/types.js';
+
+export { isAlive, launchdLabel, stopService } from './bridge/lifecycle.js';
+export type { StopOutcome } from './bridge/lifecycle.js';
 
 export { cleanEnv, runQoder } from './bridge/qoder.js';
 export type { QoderRunInput, QoderRunResult } from './bridge/qoder.js';

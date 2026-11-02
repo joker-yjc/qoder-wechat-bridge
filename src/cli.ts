@@ -8,6 +8,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { configPath, loadConfig, loadState, migrateLegacyConfig, statePath, type Config } from './config.js';
 import { runService } from './bridge/service.js';
+import { stopService } from './bridge/lifecycle.js';
 import { login } from './weixin/login.js';
 import { notify } from './notify.js';
 import { sendMediaFile, sendVoiceFromText } from './weixin/send-media.js';
@@ -23,6 +24,7 @@ const HELP = `qoder-wechat-bridge — 把个人微信单聊接到本机 Qoder
 命令：
   login              扫码登录微信，token 保存到配置文件
   run                启动常驻桥接服务
+  stop               停止运行中的桥接服务（launchd 托管时只给出命令）
   notify <内容>      主动推送一条提醒（窗口不可用时自动排队）
   send-file <路径>   发送图片/文件/视频（可选 --text 文案）
   send-voice <文本>  [实验性] 本机 TTS 语音（客户端可能不显示）
@@ -314,6 +316,28 @@ async function main(): Promise<void> {
     console.log(`目录：${dir}`);
     console.log(`删除 ${result.removed} 个文件，释放 ${formatBytes(result.bytes)}`);
     return;
+  }
+
+  if (command === 'stop') {
+    const result = await stopService();
+    switch (result.kind) {
+      case 'idle':
+        console.log(result.message);
+        return;
+      case 'supervised':
+        console.log(`桥接服务由 launchd 托管（pid ${result.pid}，标签 ${result.label}）`);
+        console.log('直接停进程会被 KeepAlive 重新拉起，要真停得连自启一起撤掉：\n');
+        console.log(`  launchctl bootout ${result.domain}/${result.label}\n`);
+        console.log(`恢复：launchctl bootstrap ${result.domain} <plist 路径>`);
+        return;
+      case 'stopped':
+        console.log(`桥接服务已停止（pid ${result.pid}，等待 ${result.waitedMs}ms）`);
+        return;
+      case 'timeout':
+        console.error(`停止信号已发出，但 pid ${result.pid} 在 ${result.waitedMs}ms 内没有退出`);
+        console.error('再执行一次 stop，目标进程收到第二次信号会立即结束');
+        process.exit(1);
+    }
   }
 
   if (command === 'run') {

@@ -35,6 +35,64 @@ export function statePath(): string {
   return path.join(stateDir(), 'state.json');
 }
 
+/** 运行记录路径：保存当前桥接进程的 pid，供 stop 命令定位 */
+export function runInfoPath(): string {
+  return path.join(stateDir(), 'run.json');
+}
+
+/** 桥接进程的运行记录 */
+export interface RunInfo {
+  /** 进程 id */
+  pid: number;
+  /** 父进程 id */
+  ppid: number;
+  /** 启动时间（ISO 字符串） */
+  startedAt: string;
+  /** 启动时的工作目录 */
+  cwd: string;
+}
+
+/** 把当前进程登记为运行中的桥接服务 */
+export function writeRunInfo(): void {
+  const info: RunInfo = {
+    pid: process.pid,
+    ppid: process.ppid,
+    startedAt: new Date().toISOString(),
+    cwd: process.cwd(),
+  };
+  writeAtomic(runInfoPath(), `${JSON.stringify(info, null, 2)}\n`, 0o600);
+}
+
+/**
+ * 读取运行记录
+ * @returns 运行记录；文件缺失或内容损坏时返回 null
+ */
+export function readRunInfo(): RunInfo | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(runInfoPath(), 'utf-8')) as Partial<RunInfo>;
+    if (typeof raw.pid !== 'number' || raw.pid <= 0) return null;
+    return { pid: raw.pid, ppid: raw.ppid ?? 0, startedAt: raw.startedAt ?? '', cwd: raw.cwd ?? '' };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 删除运行记录
+ * @param expectedPid - 传入时只删除属于该 pid 的记录，避免覆盖新实例的登记
+ */
+export function clearRunInfo(expectedPid?: number): void {
+  if (expectedPid !== undefined) {
+    const current = readRunInfo();
+    if (current && current.pid !== expectedPid) return;
+  }
+  try {
+    fs.rmSync(runInfoPath());
+  } catch {
+    // 记录本就不存在，无需处理
+  }
+}
+
 /** 桥接服务配置 */
 export interface Config {
   /** iLink API 基础地址，登录成功后服务端可能下发新的 baseUrl */

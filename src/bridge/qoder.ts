@@ -41,6 +41,9 @@ export interface QoderRunResult {
 /** 输出上限，防止异常输出撑爆内存 */
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 
+/** 子进程退出后等待 stdio 管道关闭的宽限期，超时则强制落定并销毁管道 */
+const PIPE_DRAIN_GRACE_MS = 2_000;
+
 /**
  * 构造干净的环境变量
  * 关键：从 Qoder Desktop 的 shell 启动时，继承的 QODER_* 会让 qodercli 误判为 SDK worker
@@ -120,6 +123,8 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
     let stdout = '';
     let stderr = '';
     let killedByTimeout = false;
+    let settled = false;
+    let graceTimer: NodeJS.Timeout | undefined;
 
     const timer = setTimeout(() => {
       killedByTimeout = true;
@@ -133,7 +138,10 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
       if (stderr.length < MAX_OUTPUT_BYTES) stderr += buf.toString('utf-8');
     });
     child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      clearTimeout(graceTimer);
       resolve({
         ok: false,
         text: '',
@@ -141,8 +149,21 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
         durationMs: Date.now() - startedAt,
       });
     });
-    child.on('close', (code) => {
+
+    /**
+     * 落定任务结果，只允许生效一次
+     * @param code - 退出码；宽限期强制落定时为 null
+     * @param destroyPipes - 是否销毁 stdio 管道，用于把被后代进程握着的管道释放掉
+     */
+    const finalize = (code: number | null, destroyPipes: boolean): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      clearTimeout(graceTimer);
+      if (destroyPipes) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
       const durationMs = Date.now() - startedAt;
       const parsed = parseResult(stdout);
       if (killedByTimeout) {
@@ -169,6 +190,13 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
         return;
       }
       resolve({ ok: true, text: parsed.result ?? '', sessionId: parsed.session_id, modelUsed: parsed.model, durationMs });
+    };
+
+    // 子进程退出后，它派生的后代进程可能仍持有 stdio 管道，导致 close 永不触发；
+    // 宽限期到了就用已有输出落定并销毁管道，否则桥接进程会卡在 await 上退不出去
+    child.on('exit', () => {
+      graceTimer = setTimeout(() => finalize(null, true), PIPE_DRAIN_GRACE_MS);
     });
+    child.on('close', (code) => finalize(code, false));
   });
 }

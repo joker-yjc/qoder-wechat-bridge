@@ -36,7 +36,7 @@ node dist/cli.js run
 node dist/cli.js run --cwd ~/projects/my-app
 ```
 
-停止：`Ctrl+C`。
+停止：`Ctrl+C`，或另开终端执行 `node dist/cli.js stop`。`stop` 会取消正在执行的 qodercli 任务并等它落定，实测约 2 秒退出；进程由 launchd 之类监督器托管时它不发信号（发了会被重新拉起），只打印要执行的 `launchctl bootout` 命令。
 
 ### Windows
 
@@ -71,6 +71,7 @@ node dist/cli.js login                       # 重新扫码（token 过期/换�
 node dist/cli.js notify "需要你确认一下"       # 主动提醒（无窗口时排队）
 node dist/cli.js send-file ./chart.png        # 发图片/文件/视频（≤10MB）
 node dist/cli.js send-voice "构建完成了"       # [实验性] 语音，客户端可能不显示；发音频请用 send-file
+node dist/cli.js stop                         # 停止服务（取消进行中的任务）
 node dist/cli.js clean [--days N|--all]       # 清理入站附件（默认 7 天前）
 node dist/cli.js run --inbox-dir ~/qwb-inbox  # 自定义附件目录
 node dist/cli.js run --permission-mode dont_ask
@@ -90,6 +91,7 @@ node dist/cli.js run --permission-mode dont_ask
 | 扫码后 `binded_redirect` | 该微信号已绑过其它 OpenClaw 形态机器人 | 先解绑，或换号 |
 | 收消息正常但回复失败 `ret=-2` | context_token 过期 / 下行额度耗尽 | 属通道限制；结果会进补发队列，下次入站重试 |
 | 语音只收到"没有转写"的提示 | 平台未提供该条语音的转写 | 让用户重发或改用文字；要 100% 覆盖需接 ASR |
+| `stop` 回"没有运行记录" | 服务是旧版本启的，没写过 `run.json` | 用 `pkill -f "cli.js run"` 停；之后由新版启动即可正常用 stop |
 | 日志 `-14` | 微信会话过期 | 重新 `login`；不要高频重登（会触发风控） |
 | `npm error EACCES ~/.npm/_cacache` | 缓存目录有 root 所有的文件 | 用 `--cache ./.npm-cache`，或自行修复缓存权限 |
 | `install-scripts` 拦截 esbuild | npm 11 默认禁止 postinstall | 本项目不依赖 tsx/esbuild，用 `tsc` 构建即可 |

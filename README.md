@@ -4,7 +4,7 @@
 
 适合"人不在电脑前，但想让电脑上的 Qoder 继续干活"的场景。
 
-> 当前版本 `0.1.0`：单聊文本、主动提醒、双向图片/文件/视频、语音接收（平台转写）与语音发送（macOS 原型）。
+> 当前版本 `0.1.1`：单聊文本、主动提醒、双向图片/文件/视频、语音接收（平台转写）与语音发送（macOS 原型）。
 
 ---
 
@@ -120,6 +120,8 @@ qoder-wechat run
 
 **这个终端窗口要一直开着。** 关掉窗口、按 `Ctrl+C`、或者电脑关机，服务就停了。
 
+服务挂在后台、或你找不到那个终端窗口时，用 `qoder-wechat stop` 停：它会给运行中的实例发停止信号，**正在执行的 Qoder 任务会一并取消**，不会留下继续干活的孤儿进程。服务由 launchd 之类的监督器托管时，`stop` 不会发信号（发完会被重新拉起），只打印需要执行的那条 `launchctl bootout` 命令。
+
 > 想固定某个项目目录时：`qoder-wechat run --cwd ~/projects/my-app`。不加就是全局模式，在你自己的用户目录下工作。
 
 ---
@@ -173,7 +175,7 @@ qoder-wechat run
 
 **电脑重启、终端关闭、Ctrl+C 之后，都需要再执行一次。** 登录状态是保存的，不用重新扫码。
 
-Windows 下同样用 `qoder-wechat run`，或双击仓库里的 `启动桥接.cmd`；停止用 `Ctrl+C`。
+Windows 下同样用 `qoder-wechat run`，或双击仓库里的 `启动桥接.cmd`；停止用 `Ctrl+C` 或 `qoder-wechat stop`。Windows 上 `stop` 是直接结束进程（没有 POSIX 信号那套优雅关闭），正在跑的任务子进程可能残留——这条路径尚未在 Windows 真机验证。
 
 登录过期（日志里出现 `-14`）时，重新扫码即可：
 
@@ -185,7 +187,7 @@ qoder-wechat login
 
 ```bash
 # 1. 先停掉旧服务：Ctrl+C，或另开终端执行
-pkill -f "dist/cli.js run"
+qoder-wechat stop
 
 # 2. 用新号扫码
 qoder-wechat login
@@ -234,6 +236,7 @@ qoder-wechat status                                              # 登录状态
 qoder-wechat login                 # 扫码登录 / 换号
 qoder-wechat run                   # 启动服务（前台）
 qoder-wechat run --cwd ~/project   # 指定工作目录
+qoder-wechat stop                  # 停止服务（会取消进行中的任务；launchd 托管时只打印命令）
 qoder-wechat notify "内容"          # 主动推一条提醒（窗口不可用时自动排队）
 qoder-wechat send-file shot.png    # 发图片/文件/视频（可选 --text "文案"）
 qoder-wechat send-voice "构建完成了"  # [实验性] 本机 TTS 语音（客户端可能不显示）
