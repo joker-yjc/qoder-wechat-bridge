@@ -8,11 +8,12 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { configPath, loadConfig, loadState, migrateLegacyConfig, statePath, type Config } from './config.js';
 import { runService } from './bridge/service.js';
-import { stopService } from './bridge/lifecycle.js';
+import { formatStopOutcome, stopExitCode, stopService } from './bridge/lifecycle.js';
 import { login } from './weixin/login.js';
 import { notify } from './notify.js';
 import { sendMediaFile, sendVoiceFromText } from './weixin/send-media.js';
 import { cleanInbox, inboxUsage } from './weixin/media.js';
+import { buildStatusLines, formatBytes } from './status.js';
 import { log } from './log.js';
 
 /** 帮助文本 */
@@ -139,18 +140,6 @@ function overridesFromFlags(flags: Map<string, string>): Partial<Config> {
 }
 
 /**
- * 人类可读的字节数
- * @param bytes - 字节
- * @returns 形如 1.2MB
- */
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)}GB`;
-}
-
-/**
  * status 命令
  */
 function printStatus(): void {
@@ -165,20 +154,13 @@ function printStatus(): void {
     }
   })();
   const usage = inboxUsage(config.inboxDir);
-  const lines = [
-    `配置：${configPath()}`,
-    `状态：${statePath()}`,
-    `iLink：${config.baseUrl}`,
-    `Token：${config.token ? '已配置' : '未配置'}`,
-    `机器人 ID：${config.botId || '(未登录)'}`,
-    `授权账号：${config.ownerUserId || '(未设置)'}${config.allowFrom.length ? ` + ${config.allowFrom.length} 个白名单` : ''}`,
-    `工作目录：${config.cwd.trim() || `${os.homedir()}（全局）`}`,
-    `权限模式：${config.permissionMode}`,
-    `人设：${personaInfo}`,
-    `附件目录：${config.inboxDir}（${formatBytes(usage.bytes)}，${usage.files} 个文件）`,
-    `会话数：${Object.keys(state.sessions).length}`,
-    `待补发：${state.outbox.length} 条`,
-  ];
+  const lines = buildStatusLines(config, state, {
+    configFile: configPath(),
+    stateFile: statePath(),
+    personaInfo,
+    inbox: usage,
+    home: os.homedir(),
+  });
   console.log(lines.join('\n'));
 }
 
@@ -320,24 +302,8 @@ async function main(): Promise<void> {
 
   if (command === 'stop') {
     const result = await stopService();
-    switch (result.kind) {
-      case 'idle':
-        console.log(result.message);
-        return;
-      case 'supervised':
-        console.log(`桥接服务由 launchd 托管（pid ${result.pid}，标签 ${result.label}）`);
-        console.log('直接停进程会被 KeepAlive 重新拉起，要真停得连自启一起撤掉：\n');
-        console.log(`  launchctl bootout ${result.domain}/${result.label}\n`);
-        console.log(`恢复：launchctl bootstrap ${result.domain} <plist 路径>`);
-        return;
-      case 'stopped':
-        console.log(`桥接服务已停止（pid ${result.pid}，等待 ${result.waitedMs}ms）`);
-        return;
-      case 'timeout':
-        console.error(`停止信号已发出，但 pid ${result.pid} 在 ${result.waitedMs}ms 内没有退出`);
-        console.error('再执行一次 stop，目标进程收到第二次信号会立即结束');
-        process.exit(1);
-    }
+    console.log(formatStopOutcome(result));
+    process.exit(stopExitCode(result));
   }
 
   if (command === 'run') {

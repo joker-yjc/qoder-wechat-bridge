@@ -1,6 +1,6 @@
 {
   "name": "@jcyao/qoder-wechat-bridge",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Bridge personal WeChat (iLink/OpenClaw official channel) to a local Qoder agent session.",
   "keywords": [
     "qoder",
@@ -53,7 +53,10 @@
     "login": "npm run build && node dist/cli.js login",
     "start": "npm run build && node dist/cli.js run",
     "status": "node dist/cli.js status",
-    "prepublishOnly": "npm run typecheck && npm run build && node scripts/check-publish.mjs"
+    "prepublishOnly": "npm run typecheck && npm run build && node scripts/check-publish.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "cross-spawn": "^7.0.6",
@@ -66,6 +69,9 @@
     "@types/node": "^22.9.0",
     "@types/qrcode": "^1.5.5",
     "@types/qrcode-terminal": "^0.12.2",
-    "typescript": "^5.6.3"
+    "@vitest/coverage-v8": "^5.1.0",
+    "fast-check": "^4.10.2",
+    "typescript": "^5.6.3",
+    "vitest": "^5.1.0"
   }
 }

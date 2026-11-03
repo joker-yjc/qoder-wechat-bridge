@@ -5,6 +5,7 @@
  */
 import crypto from 'node:crypto';
 import { log } from '../log.js';
+import { BridgeSendError, HttpError, classifySendError } from './errors.js';
 import type {
   GetConfigResp,
   GetUpdatesResp,
@@ -88,7 +89,7 @@ async function postJson(opts: RequestOptions, endpoint: string, body: unknown, e
     signal,
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`${opts.label} HTTP ${res.status}: ${text.slice(0, 300)}`);
+  if (!res.ok) throw new HttpError(res.status, `${opts.label}: ${text}`);
   return text;
 }
 
@@ -109,7 +110,7 @@ async function getJson(opts: RequestOptions, endpoint: string): Promise<string> 
     signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`${opts.label} HTTP ${res.status}: ${text.slice(0, 300)}`);
+  if (!res.ok) throw new HttpError(res.status, `${opts.label}: ${text}`);
   return text;
 }
 
@@ -233,6 +234,31 @@ export async function getUpdates(params: {
 }
 
 /**
+ * 把 sendmessage 回执映射为发送错误
+ * @param resp - 服务端回执
+ * @returns 发送错误；成功时为 null
+ */
+function sendFailure(resp: SendMessageResp): BridgeSendError | null {
+  const ret = resp.ret ?? 0;
+  const errcode = resp.errcode ?? 0;
+  if (ret === CONTEXT_INVALID_RET) {
+    return new BridgeSendError('下行额度耗尽', 'quota', { ret });
+  }
+  if (ret === SESSION_EXPIRED_ERRCODE || errcode === SESSION_EXPIRED_ERRCODE) {
+    return new BridgeSendError('微信会话过期', 'session_expired', { ret, errcode });
+  }
+  if (ret !== 0) {
+    return new BridgeSendError(`sendMessage ret=${ret} errmsg=${resp.errmsg ?? '(none)'}`, 'unknown', { ret });
+  }
+  if (errcode !== 0) {
+    return new BridgeSendError(`sendMessage errcode=${errcode} errmsg=${resp.errmsg ?? '(none)'}`, 'unknown', {
+      errcode,
+    });
+  }
+  return null;
+}
+
+/**
  * 发送单条消息项（官方约定 item_list 只放一个元素）
  * @param params - 目标用户、消息项、context_token
  * @returns 服务端回执
@@ -244,22 +270,27 @@ export async function sendItem(params: {
   item: unknown;
   contextToken: string;
 }): Promise<SendMessageResp> {
-  const text = await postJson(
-    { baseUrl: params.baseUrl, token: params.token, label: 'sendMessage', timeoutMs: 15_000 },
-    'ilink/bot/sendmessage',
-    {
-      msg: {
-        from_user_id: '',
-        to_user_id: params.toUserId,
-        client_id: `qoder-bridge-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
-        message_type: MessageType.BOT,
-        message_state: MessageState.FINISH,
-        item_list: [params.item],
-        context_token: params.contextToken,
+  let text: string;
+  try {
+    text = await postJson(
+      { baseUrl: params.baseUrl, token: params.token, label: 'sendMessage', timeoutMs: 15_000 },
+      'ilink/bot/sendmessage',
+      {
+        msg: {
+          from_user_id: '',
+          to_user_id: params.toUserId,
+          client_id: `qoder-bridge-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+          message_type: MessageType.BOT,
+          message_state: MessageState.FINISH,
+          item_list: [params.item],
+          context_token: params.contextToken,
+        },
+        base_info: buildBaseInfo(),
       },
-      base_info: buildBaseInfo(),
-    },
-  );
+    );
+  } catch (err) {
+    throw classifySendError(err);
+  }
   const resp = parseWeixinJson<SendMessageResp>(text);
   log.debug('sendMessage 回执', {
     ret: resp.ret,
@@ -267,12 +298,8 @@ export async function sendItem(params: {
     errmsg: resp.errmsg,
     messageId: resp.message_id,
   });
-  if (resp.ret && resp.ret !== 0) {
-    throw new Error(`sendMessage ret=${resp.ret} errmsg=${resp.errmsg ?? '(none)'}`);
-  }
-  if (resp.errcode && resp.errcode !== 0) {
-    throw new Error(`sendMessage errcode=${resp.errcode} errmsg=${resp.errmsg ?? '(none)'}`);
-  }
+  const failure = sendFailure(resp);
+  if (failure) throw failure;
   return resp;
 }
 

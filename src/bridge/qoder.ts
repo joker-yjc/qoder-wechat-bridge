@@ -5,6 +5,8 @@
 import spawn from 'cross-spawn';
 import os from 'node:os';
 import { log } from '../log.js';
+import { writeDiagnostic } from '../diagnostics.js';
+import { buildUserErrorReply, type QoderErrorKind } from './failure.js';
 
 /** 一次调用的输入 */
 export interface QoderRunInput {
@@ -23,6 +25,12 @@ export interface QoderRunInput {
   appendSystemPrompt?: string;
   /** 随任务附带的本地文件路径（--attachment） */
   attachments?: string[];
+  /** 关联任务 id，用于诊断文件 */
+  taskId: string;
+  /** 用户错误提示最大字符数 */
+  errorMaxChars?: number;
+  /** 诊断目录，测试可注入 */
+  diagnosticDir?: string;
   /** 子进程启动后回调一个取消函数，用于 /stop */
   onStart?: (cancel: () => void) => void;
 }
@@ -34,8 +42,20 @@ export interface QoderRunResult {
   sessionId?: string;
   /** 实际使用的模型（取自 modelUsage 的键，用于验证切换是否生效） */
   modelUsed?: string;
+  errorKind?: QoderErrorKind;
+  /** 短错误提示，不超过 errorMaxChars */
   error?: string;
+  exitCode?: number | null;
+  diagnosticPath?: string;
   durationMs: number;
+}
+
+/** 解析后的 result 对象 */
+interface ParsedResult {
+  result: string;
+  is_error: boolean;
+  session_id?: string;
+  model?: string;
 }
 
 /** 输出上限，防止异常输出撑爆内存 */
@@ -43,6 +63,15 @@ const MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 
 /** 子进程退出后等待 stdio 管道关闭的宽限期，超时则强制落定并销毁管道 */
 const PIPE_DRAIN_GRACE_MS = 2_000;
+
+/** 整段解析的最大长度，超过则只解析尾部行 */
+const PARSE_WHOLE_MAX = 1_000_000;
+
+/** 尾部解析行数 */
+const PARSE_TAIL_LINES = 200;
+
+/** 默认错误提示字符数 */
+const DEFAULT_ERROR_MAX_CHARS = 300;
 
 /**
  * 构造干净的环境变量
@@ -67,8 +96,18 @@ export function cleanEnv(opts: { memory?: boolean } = {}): NodeJS.ProcessEnv {
  * @param raw - qodercli 的 stdout
  * @returns 解析结果或 null
  */
-function parseResult(raw: string): { result?: string; is_error?: boolean; session_id?: string; model?: string } | null {
-  const candidates = [raw.trim(), ...raw.trim().split('\n').reverse()];
+function parseResult(raw: string): ParsedResult | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const candidates: string[] = [];
+  if (trimmed.length <= PARSE_WHOLE_MAX) candidates.push(trimmed);
+  const lines = trimmed.split('\n');
+  const start = Math.max(0, lines.length - PARSE_TAIL_LINES);
+  for (let index = lines.length - 1; index >= start; index -= 1) {
+    candidates.push(lines[index]!);
+  }
+
   for (const candidate of candidates) {
     if (!candidate.startsWith('{')) continue;
     try {
@@ -88,6 +127,21 @@ function parseResult(raw: string): { result?: string; is_error?: boolean; sessio
     }
   }
   return null;
+}
+
+/**
+ * 追加输出并遵守字节上限
+ * @param chunks - 已收集的块
+ * @param currentBytes - 已收集字节数
+ * @param buf - 新数据
+ * @returns 新的字节数
+ */
+function appendChunk(chunks: Buffer[], currentBytes: number, buf: Buffer): number {
+  if (currentBytes >= MAX_OUTPUT_BYTES) return currentBytes;
+  const remaining = MAX_OUTPUT_BYTES - currentBytes;
+  const slice = buf.length > remaining ? buf.subarray(0, remaining) : buf;
+  chunks.push(slice);
+  return currentBytes + slice.length;
 }
 
 /**
@@ -120,11 +174,17 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
     input.onStart?.(() => {
       if (!child.killed) child.kill('SIGKILL');
     });
-    let stdout = '';
-    let stderr = '';
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let killedByTimeout = false;
     let settled = false;
     let graceTimer: NodeJS.Timeout | undefined;
+
+    const readStdout = (): string => Buffer.concat(stdoutChunks).toString('utf-8');
+    const readStderr = (): string => Buffer.concat(stderrChunks).toString('utf-8');
 
     const timer = setTimeout(() => {
       killedByTimeout = true;
@@ -132,22 +192,70 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
     }, input.timeoutMs);
 
     child.stdout?.on('data', (buf: Buffer) => {
-      if (stdout.length < MAX_OUTPUT_BYTES) stdout += buf.toString('utf-8');
+      stdoutBytes = appendChunk(stdoutChunks, stdoutBytes, buf);
     });
     child.stderr?.on('data', (buf: Buffer) => {
-      if (stderr.length < MAX_OUTPUT_BYTES) stderr += buf.toString('utf-8');
+      stderrBytes = appendChunk(stderrChunks, stderrBytes, buf);
     });
-    child.on('error', (err) => {
+
+    /**
+     * 落定失败结果，只允许生效一次
+     * @param kind - 失败类别
+     * @param opts - 诊断与结果字段
+     */
+    const settleFailure = (
+      kind: QoderErrorKind,
+      opts: {
+        exitCode?: number | null;
+        detail?: string;
+        sessionId?: string;
+        modelUsed?: string;
+      } = {},
+    ): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(graceTimer);
+      const durationMs = Date.now() - startedAt;
+      const stdout = readStdout();
+      const stderr = readStderr();
+      const exitCode = opts.exitCode ?? null;
+      const diagnostic = writeDiagnostic(
+        {
+          taskId: input.taskId,
+          sessionId: opts.sessionId ?? input.sessionId,
+          kind,
+          exitCode,
+          durationMs,
+          stdout,
+          stderr,
+        },
+        { dir: input.diagnosticDir },
+      );
+      const error = buildUserErrorReply({
+        kind,
+        exitCode,
+        detail: opts.detail,
+        timeoutMs: input.timeoutMs,
+        maxChars: input.errorMaxChars ?? DEFAULT_ERROR_MAX_CHARS,
+      });
       resolve({
         ok: false,
         text: '',
-        error: `无法启动 ${input.bin}：${err.message}`,
-        durationMs: Date.now() - startedAt,
+        sessionId: opts.sessionId ?? input.sessionId,
+        modelUsed: opts.modelUsed,
+        errorKind: kind,
+        error,
+        exitCode,
+        diagnosticPath: diagnostic.path || undefined,
+        durationMs,
       });
+    };
+
+    child.on('error', (err) => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      settleFailure('spawn', { exitCode: null, detail: err.message });
     });
 
     /**
@@ -157,39 +265,60 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
      */
     const finalize = (code: number | null, destroyPipes: boolean): void => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      clearTimeout(graceTimer);
       if (destroyPipes) {
         child.stdout?.destroy();
         child.stderr?.destroy();
       }
-      const durationMs = Date.now() - startedAt;
+      const stdout = readStdout();
+      const stderr = readStderr();
       const parsed = parseResult(stdout);
+
       if (killedByTimeout) {
-        resolve({
-          ok: false,
-          text: '',
-          error: `任务超过 ${Math.round(input.timeoutMs / 1000)} 秒被终止`,
-          durationMs,
+        settleFailure('timeout', { exitCode: null, detail: undefined });
+        return;
+      }
+      if (!stdout.trim() && !stderr.trim()) {
+        settleFailure('empty', {
+          exitCode: code,
+          sessionId: parsed?.session_id,
+          modelUsed: parsed?.model,
         });
         return;
       }
       if (!parsed) {
         log.error('qodercli 输出无法解析', { code, stdout: stdout.slice(0, 500), stderr: stderr.slice(0, 500) });
-        resolve({
-          ok: false,
-          text: '',
-          error: stderr.trim() || stdout.trim() || `qodercli 退出码 ${code}`,
-          durationMs,
+        settleFailure('parse', { exitCode: code });
+        return;
+      }
+      if (code !== 0) {
+        settleFailure('exit', {
+          exitCode: code,
+          sessionId: parsed.session_id,
+          modelUsed: parsed.model,
         });
         return;
       }
       if (parsed.is_error) {
-        resolve({ ok: false, text: parsed.result ?? '', error: parsed.result || 'qodercli 返回错误', sessionId: parsed.session_id, modelUsed: parsed.model, durationMs });
+        settleFailure('is_error', {
+          exitCode: code,
+          detail: parsed.result,
+          sessionId: parsed.session_id,
+          modelUsed: parsed.model,
+        });
         return;
       }
-      resolve({ ok: true, text: parsed.result ?? '', sessionId: parsed.session_id, modelUsed: parsed.model, durationMs });
+
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      resolve({
+        ok: true,
+        text: parsed.result,
+        sessionId: parsed.session_id,
+        modelUsed: parsed.model,
+        exitCode: code,
+        durationMs: Date.now() - startedAt,
+      });
     };
 
     // 子进程退出后，它派生的后代进程可能仍持有 stdio 管道，导致 close 永不触发；

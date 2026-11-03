@@ -34,14 +34,40 @@ export function pendingFilePath(): string {
 }
 
 /**
+ * 统计待发队列条数
+ * @returns 条数
+ */
+function pendingCount(): number {
+  const file = pendingFilePath();
+  if (!fs.existsSync(file)) return 0;
+  try {
+    return fs.readFileSync(file, 'utf-8').split('\n').filter((line) => line.trim()).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * 追加到待发队列
  * @param items - 待发提醒
+ * @param maxItems - 队列上限
+ * @returns 入队与拒绝条数
  */
-function appendPending(items: PendingNotice[]): void {
-  if (items.length === 0) return;
+function appendPending(items: PendingNotice[], maxItems: number): { queued: number; rejected: number } {
+  if (items.length === 0) return { queued: 0, rejected: 0 };
+  const existing = pendingCount();
+  if (existing + items.length > maxItems) {
+    log.warn('待发提醒队列已满，拒绝新增', {
+      existing,
+      incoming: items.length,
+      maxItems,
+    });
+    return { queued: 0, rejected: items.length };
+  }
   fs.mkdirSync(stateDir(), { recursive: true });
   const lines = items.map((item) => JSON.stringify(item)).join('\n');
   fs.appendFileSync(pendingFilePath(), `${lines}\n`, { encoding: 'utf-8', mode: 0o600 });
+  return { queued: items.length, rejected: 0 };
 }
 
 /**
@@ -61,11 +87,21 @@ export function takePending(): PendingNotice[] {
   try {
     const raw = fs.readFileSync(processing, 'utf-8');
     const items: PendingNotice[] = [];
+    const ttlMs = loadConfig().outboxTtlMs;
+    const now = Date.now();
     for (const line of raw.split('\n')) {
       if (!line.trim()) continue;
       try {
         const item = JSON.parse(line) as PendingNotice;
-        if (item.toUserId && item.text) items.push(item);
+        if (!item.toUserId || !item.text) continue;
+        if (typeof item.createdAt !== 'number' || now - item.createdAt > ttlMs) {
+          log.warn('提醒已过期，已丢弃', {
+            id: item.id,
+            ageMs: typeof item.createdAt === 'number' ? now - item.createdAt : null,
+          });
+          continue;
+        }
+        items.push(item);
       } catch {
         // 跳过坏行
       }
@@ -106,9 +142,10 @@ export async function notify(text: string, toUserId?: string): Promise<NotifyRes
    * 把剩余片段放进队列
    * @param rest - 剩余片段
    * @param reason - 原因
+   * @param sent - 已经成功发送的条数
    * @returns 结果
    */
-  const queue = (rest: string[], reason: string): NotifyResult => {
+  const queue = (rest: string[], reason: string, sent = 0): NotifyResult => {
     const now = Date.now();
     const items = rest.map((chunk, index) => ({
       id: `${now}-${index}-${Math.random().toString(36).slice(2, 8)}`,
@@ -116,13 +153,21 @@ export async function notify(text: string, toUserId?: string): Promise<NotifyRes
       text: chunk,
       createdAt: now,
     }));
-    appendPending(items);
-    log.warn('提醒未送达，已排队', { target, count: items.length, reason });
+    const queued = appendPending(items, config.outboxMaxItems);
+    if (queued.rejected > 0) {
+      return {
+        status: 'error',
+        message: `待发提醒队列已满（上限 ${config.outboxMaxItems} 条），未入队。`,
+        sent,
+        queued: 0,
+      };
+    }
+    log.warn('提醒未送达，已排队', { target, count: queued.queued, reason });
     return {
       status: 'queued',
-      message: `未送达：${reason}\n已排队 ${items.length} 条，等你下次给机器人发消息时自动补发。`,
-      sent: 0,
-      queued: items.length,
+      message: `未送达：${reason}\n已排队 ${queued.queued} 条，等你下次给机器人发消息时自动补发。`,
+      sent,
+      queued: queued.queued,
     };
   };
 
@@ -139,9 +184,9 @@ export async function notify(text: string, toUserId?: string): Promise<NotifyRes
       const reason = String(err);
       const rest = chunks.slice(sent);
       if (reason.includes(String(SESSION_EXPIRED_ERRCODE))) {
-        return queue(rest, '微信会话已过期（-14），需要重新登录');
+        return queue(rest, '微信会话已过期（-14），需要重新登录', sent);
       }
-      return queue(rest, `发送失败（${reason.slice(0, 120)}）`);
+      return queue(rest, `发送失败（${reason.slice(0, 120)}）`, sent);
     }
   }
   return { status: 'sent', message: `已推送 ${sent} 条提醒。`, sent, queued: 0 };
