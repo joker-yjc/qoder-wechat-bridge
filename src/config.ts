@@ -133,6 +133,26 @@ export interface Config {
   maxRepliesPerTurn: number;
   /** getUpdates 长轮询超时 */
   pollTimeoutMs: number;
+  /** outbox 最大条数，超出后丢弃最旧消息 */
+  outboxMaxItems: number;
+  /** outbox 消息最长保留时间 */
+  outboxTtlMs: number;
+  /** 永久 / 未知失败达到该次数后移入隔离区 */
+  poisonMaxAttempts: number;
+  /** 瞬时失败达到该次数后移入隔离区 */
+  transientMaxAttempts: number;
+  /** 隔离区最大条数 */
+  quarantineMaxItems: number;
+  /** 隔离区消息最长保留时间 */
+  quarantineTtlMs: number;
+  /** 单条用户错误提示最大字符数 */
+  userErrorMaxChars: number;
+  /** 单次失败诊断文件最大字节数 */
+  diagnosticMaxBytes: number;
+  /** 诊断文件保留天数 */
+  diagnosticRetentionDays: number;
+  /** qodercli --version 预检超时 */
+  preflightVersionTimeoutMs: number;
 }
 
 /** 默认配置：面向通用场景，安全优先 */
@@ -156,6 +176,16 @@ export const DEFAULT_CONFIG: Config = {
   maxReplyChars: 2_000,
   maxRepliesPerTurn: 9,
   pollTimeoutMs: 35_000,
+  outboxMaxItems: 200,
+  outboxTtlMs: 24 * 60 * 60_000,
+  poisonMaxAttempts: 3,
+  transientMaxAttempts: 10,
+  quarantineMaxItems: 500,
+  quarantineTtlMs: 7 * 24 * 60 * 60_000,
+  userErrorMaxChars: 300,
+  diagnosticMaxBytes: 64 * 1024,
+  diagnosticRetentionDays: 7,
+  preflightVersionTimeoutMs: 5_000,
 };
 
 /** 环境变量覆盖表 */
@@ -177,6 +207,16 @@ const ENV_OVERRIDES: ReadonlyArray<[keyof Config, string, (raw: string) => unkno
   ['qoderTimeoutMs', 'QWB_TIMEOUT_MS', (v) => Number(v)],
   ['maxReplyChars', 'QWB_MAX_REPLY_CHARS', (v) => Number(v)],
   ['maxRepliesPerTurn', 'QWB_MAX_REPLIES', (v) => Number(v)],
+  ['outboxMaxItems', 'QWB_OUTBOX_MAX', (v) => Number(v)],
+  ['outboxTtlMs', 'QWB_OUTBOX_TTL_MS', (v) => Number(v)],
+  ['poisonMaxAttempts', 'QWB_POISON_ATTEMPTS', (v) => Number(v)],
+  ['transientMaxAttempts', 'QWB_TRANSIENT_ATTEMPTS', (v) => Number(v)],
+  ['quarantineMaxItems', 'QWB_QUARANTINE_MAX', (v) => Number(v)],
+  ['quarantineTtlMs', 'QWB_QUARANTINE_TTL_MS', (v) => Number(v)],
+  ['userErrorMaxChars', 'QWB_USER_ERROR_CHARS', (v) => Number(v)],
+  ['diagnosticMaxBytes', 'QWB_DIAG_MAX_BYTES', (v) => Number(v)],
+  ['diagnosticRetentionDays', 'QWB_DIAG_RETENTION_DAYS', (v) => Number(v)],
+  ['preflightVersionTimeoutMs', 'QWB_PREFLIGHT_VERSION_TIMEOUT_MS', (v) => Number(v)],
 ];
 
 /** 某个微信用户对应的 Qoder 会话 */
@@ -186,21 +226,58 @@ export interface SessionRecord {
   turns: number;
 }
 
+/** 出站消息类别 */
+export type OutboxItemKind = 'reply' | 'notice' | 'error';
+
 /** 因超时/额度未能送达、留待下次入站补发的结果 */
 export interface OutboxItem {
   id: string;
   toUserId: string;
   text: string;
+  kind: OutboxItemKind;
   createdAt: number;
-  attempts: number;
+  /** UTF-8 字节数，入队时计算（用于日志与 status） */
+  bytes: number;
+  /** 永久 / 未知失败次数 */
+  failures: number;
+  /** 瞬时失败次数 */
+  transientFailures: number;
+  /** 最近一次失败类别 */
+  lastErrorKind?: string;
+  /** 最近一次失败时间 */
+  lastErrorAt?: number;
+  /** 关联任务 id */
+  taskId?: string;
+}
+
+/** 已判定为毒丸、不再自动补发的消息 */
+export interface QuarantineItem extends OutboxItem {
+  quarantinedAt: number;
+  reason: string;
+  /** 脱敏后的截断预览 */
+  preview: string;
+}
+
+/** 下行额度连续告警状态 */
+export interface QuotaState {
+  /** 连续命中 ret=-2 的入站窗口数 */
+  streak: number;
+  /** 最近一次 ret=-2 的时间 */
+  lastAt: number;
 }
 
 /** 持久化运行状态 */
 export interface State {
+  /** 状态版本 */
+  version: number;
   /** getUpdates 游标，重启不丢消息 */
   getUpdatesBuf: string;
   sessions: Record<string, SessionRecord>;
   outbox: OutboxItem[];
+  /** 隔离区，重启后不回到 outbox */
+  quarantine: QuarantineItem[];
+  /** 下行额度连续告警 */
+  quota: QuotaState;
   /** 最近处理过的消息 id，用于去重 */
   seenMessageIds: string[];
   /** 微信用户 -> 指定的模型 id（缺省用配置里的默认模型） */
@@ -211,9 +288,12 @@ export interface State {
 
 /** 状态默认值 */
 export const DEFAULT_STATE: State = {
+  version: 2,
   getUpdatesBuf: '',
   sessions: {},
   outbox: [],
+  quarantine: [],
+  quota: { streak: 0, lastAt: 0 },
   seenMessageIds: [],
   models: {},
   contextTokens: {},
@@ -270,15 +350,103 @@ export function saveConfig(config: Config): void {
 }
 
 /**
+ * 判断是否为普通对象
+ * @param value - 任意值
+ * @returns 是否为普通对象
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 读取数字字段，非法值回退
+ * @param value - 原始值
+ * @param fallback - 回退值
+ * @returns 数字
+ */
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * 把旧版 / 损坏的 outbox 项补齐为新结构
+ * @param raw - 原始项
+ * @returns 归一化后的项
+ */
+function normalizeOutboxItem(raw: Record<string, unknown>): OutboxItem {
+  const text = typeof raw.text === 'string' ? raw.text : '';
+  const createdAt = asNumber(raw.createdAt, Date.now());
+  const kind: OutboxItemKind = raw.kind === 'notice' || raw.kind === 'error' ? raw.kind : 'reply';
+  return {
+    id: typeof raw.id === 'string' ? raw.id : `${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
+    toUserId: typeof raw.toUserId === 'string' ? raw.toUserId : '',
+    text,
+    kind,
+    createdAt,
+    bytes: asNumber(raw.bytes, Buffer.byteLength(text, 'utf8')),
+    failures: asNumber(raw.failures, asNumber(raw.attempts, 0)),
+    transientFailures: asNumber(raw.transientFailures, 0),
+    lastErrorKind: typeof raw.lastErrorKind === 'string' ? raw.lastErrorKind : undefined,
+    lastErrorAt: typeof raw.lastErrorAt === 'number' ? raw.lastErrorAt : undefined,
+    taskId: typeof raw.taskId === 'string' ? raw.taskId : undefined,
+  };
+}
+
+/**
+ * 把旧版 / 损坏的隔离项补齐为新结构
+ * @param raw - 原始项
+ * @returns 归一化后的隔离项
+ */
+function normalizeQuarantineItem(raw: Record<string, unknown>): QuarantineItem {
+  const base = normalizeOutboxItem(raw);
+  return {
+    ...base,
+    quarantinedAt: asNumber(raw.quarantinedAt, base.createdAt),
+    reason: typeof raw.reason === 'string' ? raw.reason : 'unknown',
+    preview: typeof raw.preview === 'string' ? raw.preview : base.text.slice(0, 120),
+  };
+}
+
+/**
+ * 把任意状态归一化为 v2
+ * @param raw - 原始状态
+ * @returns 归一化后的状态
+ */
+export function normalizeState(raw: Record<string, unknown>): State {
+  const outbox = Array.isArray(raw.outbox) ? raw.outbox.filter(isRecord).map(normalizeOutboxItem) : [];
+  const quarantine = Array.isArray(raw.quarantine)
+    ? raw.quarantine.filter(isRecord).map(normalizeQuarantineItem)
+    : [];
+  const quotaRaw = isRecord(raw.quota) ? raw.quota : {};
+  return {
+    ...DEFAULT_STATE,
+    ...raw,
+    version: 2,
+    outbox,
+    quarantine,
+    quota: {
+      streak: asNumber(quotaRaw.streak, 0),
+      lastAt: asNumber(quotaRaw.lastAt, 0),
+    },
+    sessions: isRecord(raw.sessions) ? (raw.sessions as Record<string, SessionRecord>) : {},
+    seenMessageIds: Array.isArray(raw.seenMessageIds)
+      ? raw.seenMessageIds.filter((value): value is string => typeof value === 'string')
+      : [],
+    models: isRecord(raw.models) ? (raw.models as Record<string, string>) : {},
+    contextTokens: isRecord(raw.contextTokens) ? (raw.contextTokens as Record<string, string>) : {},
+  };
+}
+
+/**
  * 读取状态
- * @returns 合并后的状态
+ * @returns 归一化后的状态
  */
 export function loadState(): State {
   try {
-    const raw = fs.readFileSync(statePath(), 'utf-8');
-    return { ...DEFAULT_STATE, ...(JSON.parse(raw) as Partial<State>) };
+    const parsed = JSON.parse(fs.readFileSync(statePath(), 'utf-8')) as unknown;
+    return normalizeState(isRecord(parsed) ? parsed : {});
   } catch {
-    return { ...DEFAULT_STATE };
+    return normalizeState({});
   }
 }
 

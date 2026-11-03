@@ -120,7 +120,7 @@ qoder-wechat run
 
 **这个终端窗口要一直开着。** 关掉窗口、按 `Ctrl+C`、或者电脑关机，服务就停了。
 
-服务挂在后台、或你找不到那个终端窗口时，用 `qoder-wechat stop` 停：它会给运行中的实例发停止信号，**正在执行的 Qoder 任务会一并取消**，不会留下继续干活的孤儿进程。服务由 launchd 之类的监督器托管时，`stop` 不会发信号（发完会被重新拉起），只打印需要执行的那条 `launchctl bootout` 命令。
+服务挂在后台、或你找不到那个终端窗口时，用 `qoder-wechat stop` 停：手动启动的实例会收到 SIGTERM，**正在执行的 Qoder 任务会一并取消**，正常退出返回 0，超时返回 1。服务由 launchd 之类的监督器托管时，`stop` 不会发信号（发了会被 KeepAlive 重新拉起），而是打印 `launchctl bootout`、验证、恢复和兜底命令，并以退出码 2 表示“仍在运行、需要你手动执行”。运行记录丢失时也会继续按进程和 launchd 标签查找。
 
 > 想固定某个项目目录时：`qoder-wechat run --cwd ~/projects/my-app`。不加就是全局模式，在你自己的用户目录下工作。
 
@@ -151,7 +151,7 @@ qoder-wechat clean --all                             # 全部删除
 | 命令 | 作用 |
 |---|---|
 | `/help` | 看全部命令 |
-| `/status` | 看当前工作目录、模型、会话、待补发条数 |
+| `/status` | 看工作目录、模型、会话、待补发、隔离区与额度状态 |
 | `/model` | 看有哪些模型、当前用哪个 |
 | `/model 3` | 按序号切换模型（下一条任务生效） |
 | `/model [my-provider] glm-5.3` | 按名称切换模型 |
@@ -220,9 +220,11 @@ qoder-wechat status                                              # 登录状态
 
 **报 `SyntaxError: Invalid regular expression flags`？** Node 版本太低，`node -v` 确认 ≥ 20。
 
-**任务跑了但微信没收到？** 官方通道有额度限制：一次入站大约只能回 10 条消息，`context_token` 约 24 小时过期。超出部分会进入补发队列，下次你发消息时自动补发。日志里的 `ret=-2` 就是这种情况。
+**任务跑了但微信没收到？** 官方通道有额度限制：一次入站大约只能回 10 条消息，`context_token` 约 24 小时过期。`ret=-2` 现在按“额度耗尽”处理：消息保留在 outbox，下一次入站优先补发，不会计入失败次数，也不会被隔离。补发队列默认上限 200 条 / 24 小时，超限时丢弃最旧消息并写日志；连续多个窗口出现 `ret=-2` 时，`status` 会显示告警。
 
-**结果太长会怎样？** 按每条 2000 字切分，最多发 9 条；剩下的进补发队列。
+**qodercli 崩了会收到什么？** 只会收到一条 ≤300 字的短提示，包含失败类别和退出码；完整的 stdout / stderr 写到 `~/.local/state/qoder-wechat-bridge/logs/diagnostics/YYYY-MM-DD/`（单文件 ≤64KB，保留 7 天），不会把源码或几百 KB 文本发到微信。
+
+**结果太长会怎样？** 仍按每条 2000 字切分，最多发 9 条；剩下的进补发队列（默认 200 条 / 24 小时）。如果某条消息连续 3 次永久失败，会移入隔离区，后面的正常消息继续送达；隔离区默认保留 7 天。
 
 **能拉进群吗？** 不能。官方个人微信通道只开放单聊。
 
@@ -236,7 +238,7 @@ qoder-wechat status                                              # 登录状态
 qoder-wechat login                 # 扫码登录 / 换号
 qoder-wechat run                   # 启动服务（前台）
 qoder-wechat run --cwd ~/project   # 指定工作目录
-qoder-wechat stop                  # 停止服务（会取消进行中的任务；launchd 托管时只打印命令）
+qoder-wechat stop                  # 停止服务（取消进行中的任务；launchd 托管时打印命令并返回 2）
 qoder-wechat notify "内容"          # 主动推一条提醒（窗口不可用时自动排队）
 qoder-wechat send-file shot.png    # 发图片/文件/视频（可选 --text "文案"）
 qoder-wechat send-voice "构建完成了"  # [实验性] 本机 TTS 语音（客户端可能不显示）
@@ -302,6 +304,16 @@ qoder-wechat notify "构建完成，有 3 个测试失败，需要你确认是�
 | `qoderTimeoutMs` | `QWB_TIMEOUT_MS` | `600000` | 单任务超时 |
 | `maxReplyChars` | `QWB_MAX_REPLY_CHARS` | `2000` | 单条消息最大字符数 |
 | `maxRepliesPerTurn` | `QWB_MAX_REPLIES` | `9` | 单轮最多下行条数 |
+| `outboxMaxItems` | `QWB_OUTBOX_MAX` | `200` | outbox 最大条数，超限丢最旧 |
+| `outboxTtlMs` | `QWB_OUTBOX_TTL_MS` | `86400000` | outbox 消息保留时长（24 小时） |
+| `poisonMaxAttempts` | `QWB_POISON_ATTEMPTS` | `3` | 永久失败达到该次数后隔离 |
+| `transientMaxAttempts` | `QWB_TRANSIENT_ATTEMPTS` | `10` | 瞬时失败达到该次数后隔离 |
+| `quarantineMaxItems` | `QWB_QUARANTINE_MAX` | `500` | 隔离区最大条数 |
+| `quarantineTtlMs` | `QWB_QUARANTINE_TTL_MS` | `604800000` | 隔离区保留时长（7 天） |
+| `userErrorMaxChars` | `QWB_USER_ERROR_CHARS` | `300` | 单条错误提示最大字符数 |
+| `diagnosticMaxBytes` | `QWB_DIAG_MAX_BYTES` | `65536` | 单次失败诊断文件上限 |
+| `diagnosticRetentionDays` | `QWB_DIAG_RETENTION_DAYS` | `7` | 诊断文件保留天数 |
+| `preflightVersionTimeoutMs` | `QWB_PREFLIGHT_VERSION_TIMEOUT_MS` | `5000` | `qodercli --version` 预检超时 |
 
 模型切换细节：内置模型直接写名字（如 `GLM-5.3`）；自定义 provider 的模型必须写成 `<providerId>/<model>`，否则 Qoder 会静默回落到 `auto`。`/model` 命令已处理这层映射。
 
@@ -353,13 +365,18 @@ console.log(result.ok, result.text);
 - 仅单聊；官方通道 `groupPolicy: "disabled"`，不支持群聊。
 - 一次入站大约只有 **10 条下行额度**，`context_token` 约 **24 小时**时效（社区实测，官方未公布数值）。
 - `ret=0` 只代表接口受理，不保证送达；风控可能静默过滤。
+- 出站分片仍按 **2000 字符**，本期没有引入 UTF-8 字节上限；超长中文仍可能受通道实际限制影响。
+- outbox 默认 **200 条 / 24 小时**；隔离区默认 **500 条 / 7 天**。超限或过期会丢最旧消息并写日志。
+- qodercli 失败的完整诊断只在本机 `logs/diagnostics/`，不会发到微信；单文件 ≤64KB，保留 7 天。
+- `stop` 在 launchd 托管下返回 **2**，表示服务仍在运行，需要手动执行它打印的 `launchctl bootout`。
 - Windows 可用：收发、附件、通知等与 macOS 一致；登录二维码需手动打开 `~/.local/state/qoder-wechat-bridge/wechat-qr.png`。
 - 出站语音为实验性：协议字段已对齐，但微信客户端不渲染；发音频请用 `send-file`。
 - 任务在 CLI 侧执行，Qoder 桌面版历史里看不到。
-- v0.1 没有开机自启，重启后需要手动 `run`。
+- 本包不内置开机自启；需要常驻请自行配置 launchd / systemd。
 
 ## Roadmap
 
+- `0.2`：出站故障隔离、错误限长、outbox 上限/TTL、stop 加固、启动预检（当前版本）。
 - `0.3`：双向决策（`ask`：发问题后等待微信回复再继续）、开机自启（LaunchAgent / systemd）
 - `0.4`：图片与文件、进度提示、多会话与按项目路由
 - `0.5`：`init` / `init --rebind` / `logout` 等账号管理命令

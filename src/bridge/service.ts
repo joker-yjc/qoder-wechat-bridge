@@ -11,6 +11,8 @@ import {
   saveState,
   writeRunInfo,
   type Config,
+  type OutboxItem,
+  type OutboxItemKind,
   type State,
 } from '../config.js';
 import os from 'node:os';
@@ -27,10 +29,15 @@ import {
   sendTyping,
   SESSION_EXPIRED_ERRCODE,
 } from '../weixin/client.js';
+import { classifySendError } from '../weixin/errors.js';
 import { MessageItemType, MessageType, TypingStatus, type MessageItem, type WeixinMessage } from '../weixin/types.js';
 import { downloadItemMedia, pruneInbox, type SavedMedia } from '../weixin/media.js';
 import { runQoder } from './qoder.js';
-import { chunkText } from './reply.js';
+import { flushOutbox, pruneOutbox, pushOutbox, type DeliveryOutcome, type OutboxPolicy } from './outbox.js';
+import { OutboundSession } from './outbound.js';
+import { buildUserErrorReply } from './failure.js';
+import { redactSensitive, pruneDiagnostics } from '../diagnostics.js';
+import { detectNodeChange, nodeFingerprint, runPreflight, type PreflightResult } from './preflight.js';
 import { takePending } from '../notify.js';
 import { loadPersona } from '../persona.js';
 
@@ -40,6 +47,46 @@ export interface BridgeHandle {
   stop: () => void;
   /** 当前生效配置 */
   config: Config;
+}
+
+/** 可注入依赖，便于单测 */
+export interface ServiceDeps {
+  sendText?: typeof sendText;
+  runQoder?: typeof runQoder;
+  takePending?: typeof takePending;
+  loadPersona?: typeof loadPersona;
+  listModels?: typeof listModels;
+  getTypingTicket?: typeof getTypingTicket;
+  sendTyping?: typeof sendTyping;
+  downloadItemMedia?: typeof downloadItemMedia;
+  runPreflight?: typeof runPreflight;
+  pruneDiagnostics?: typeof pruneDiagnostics;
+  pruneInbox?: typeof pruneInbox;
+  login?: typeof login;
+  notifyClient?: typeof notifyClient;
+  getUpdates?: typeof getUpdates;
+  writeRunInfo?: typeof writeRunInfo;
+  clearRunInfo?: typeof clearRunInfo;
+  nodeFingerprint?: typeof nodeFingerprint;
+  now?: () => number;
+  onSessionExpired?: () => void;
+}
+
+/** 桥接运行时 */
+export interface BridgeRuntime {
+  handleInbound: (msg: WeixinMessage) => Promise<void>;
+  processTask: (
+    userId: string,
+    text: string,
+    contextToken: string,
+    attachments?: string[],
+    taskId?: string,
+  ) => Promise<void>;
+  cancelAllTasks: () => void;
+  waitForIdle: () => Promise<void>;
+  prune: () => void;
+  getConfig: () => Config;
+  getState: () => State;
 }
 
 /**
@@ -75,26 +122,95 @@ function buildPrompt(text: string, media: SavedMedia[], failures: string[]): str
 }
 
 /**
- * 启动常驻桥接服务
- * @param overrides - 覆盖配置文件中的字段（不落盘）
- * @returns 运行句柄
+ * 构造一个 outbox 消息
+ * @param input - 消息字段
+ * @returns outbox 消息
  */
-export async function runService(overrides: Partial<Config> = {}): Promise<BridgeHandle> {
-  ensureDirs();
-  let config: Config = { ...loadConfig(), ...overrides };
-  const state: State = loadState();
-  try {
-    pruneInbox(config.inboxDir);
-  } catch {
-    // 清理失败不影响启动
+function makeOutboxItem(input: {
+  id: string;
+  toUserId: string;
+  text: string;
+  kind: OutboxItemKind;
+  createdAt: number;
+  failures?: number;
+}): OutboxItem {
+  return {
+    ...input,
+    bytes: Buffer.byteLength(input.text, 'utf8'),
+    failures: input.failures ?? 0,
+    transientFailures: 0,
+  };
+}
+
+/**
+ * 生成任务 id
+ * @param now - 当前时间
+ * @returns 任务 id
+ */
+function makeTaskId(now: number): string {
+  return `${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 把发送异常转换为补发队列结果
+ * @param err - 原始异常
+ * @returns 补发队列结果
+ */
+function toDeliveryOutcome(err: unknown): DeliveryOutcome {
+  const failure = classifySendError(err);
+  switch (failure.kind) {
+    case 'quota':
+      return { kind: 'quota' };
+    case 'session_expired':
+      return { kind: 'session_expired' };
+    case 'transient':
+      return { kind: 'transient', reason: failure.message };
+    case 'permanent':
+      return { kind: 'permanent', reason: failure.message };
+    default:
+      return { kind: 'unknown', reason: failure.message };
   }
-  let running = true;
-  /** 用于中断长轮询，保证 Ctrl+C 后立即退出 */
-  const abortController = new AbortController();
+}
+
+/**
+ * 创建桥接运行时
+ * @param initialConfig - 初始配置
+ * @param state - 运行状态
+ * @param deps - 可注入依赖
+ * @returns 运行时
+ */
+export function createBridgeRuntime(initialConfig: Config, state: State, deps: ServiceDeps = {}): BridgeRuntime {
+  let config = initialConfig;
+  const sendTextFn = deps.sendText ?? sendText;
+  const runQoderFn = deps.runQoder ?? runQoder;
+  const takePendingFn = deps.takePending ?? takePending;
+  const loadPersonaFn = deps.loadPersona ?? loadPersona;
+  const listModelsFn = deps.listModels ?? listModels;
+  const getTypingTicketFn = deps.getTypingTicket ?? getTypingTicket;
+  const sendTypingFn = deps.sendTyping ?? sendTyping;
+  const downloadMediaFn = deps.downloadItemMedia ?? downloadItemMedia;
+  const nodeFingerprintFn = deps.nodeFingerprint ?? nodeFingerprint;
+  const now = deps.now ?? ((): number => Date.now());
+  let nodeSnapshot = nodeFingerprintFn();
   /** 每个微信用户一条串行队列，避免同一会话并发 */
   const queues = new Map<string, Promise<void>>();
   /** 每个用户当前正在执行的任务句柄，用于 /stop 强制停止 */
   const runningTasks = new Map<string, { cancel: () => void; cancelled: boolean }>();
+
+  /**
+   * 当前队列策略
+   * @returns 队列策略
+   */
+  const outboxPolicy = (): OutboxPolicy => ({
+    maxItems: config.outboxMaxItems,
+    ttlMs: config.outboxTtlMs,
+    poisonMaxAttempts: config.poisonMaxAttempts,
+    transientMaxAttempts: config.transientMaxAttempts,
+    quarantineMaxItems: config.quarantineMaxItems,
+    quarantineTtlMs: config.quarantineTtlMs,
+    now,
+    redact: redactSensitive,
+  });
 
   /** 持久化状态 */
   const persistState = (): void => {
@@ -130,24 +246,408 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
   };
 
   /**
-   * 发送一条文本，失败时记录原因
-   * @param toUserId - 目标用户
+   * 直接发送一条控制类消息（不进入 outbox）
+   * @param userId - 目标用户
    * @param contextToken - 上下文令牌
    * @param text - 正文
    * @returns 是否发送成功
    */
-  const deliver = async (toUserId: string, contextToken: string, text: string): Promise<boolean> => {
+  const sendControl = async (userId: string, contextToken: string, text: string): Promise<boolean> => {
     try {
-      await sendText({ baseUrl: config.baseUrl, token: config.token, toUserId, text, contextToken });
+      await sendTextFn({ baseUrl: config.baseUrl, token: config.token, toUserId: userId, text, contextToken });
       return true;
     } catch (err) {
-      const msg = String(err);
-      log.error('发送失败', { toUserId, error: msg, preview: text.slice(0, 60) });
-      if (msg.includes(String(SESSION_EXPIRED_ERRCODE))) {
-        running = false;
-        log.error('会话过期（-14），停止循环，请重新执行 login');
-      }
+      const failure = classifySendError(err);
+      log.warn('控制消息发送失败', {
+        category: failure.kind,
+        toUserId: userId,
+        chars: text.length,
+        reason: failure.message.slice(0, 120),
+      });
+      if (failure.kind === 'session_expired') deps.onSessionExpired?.();
       return false;
+    }
+  };
+
+  /**
+   * 补发 CLI 侧暂存的主动提醒
+   * @param userId - 当前入站用户
+   */
+  const ingestPending = (userId: string): void => {
+    const pending = takePendingFn();
+    if (pending.length === 0) return;
+    log.info('补发主动提醒', { count: pending.length, userId });
+    for (const item of pending) {
+      const outboxItem = makeOutboxItem({
+        id: item.id,
+        toUserId: item.toUserId,
+        text: item.text,
+        kind: 'notice',
+        createdAt: item.createdAt,
+      });
+      const { dropped } = pushOutbox(state, outboxItem, outboxPolicy());
+      if (dropped.length > 0) {
+        log.warn('outbox 超限，已丢弃最旧消息', {
+          count: dropped.length,
+          ids: dropped.map((message) => message.id),
+        });
+      }
+    }
+    state.outbox.sort((left, right) => left.createdAt - right.createdAt);
+    persistState();
+  };
+
+  /** 清理过期 / 超限消息 */
+  const prune = (): void => {
+    const result = pruneOutbox(state, outboxPolicy());
+    if (result.expired.length > 0) {
+      log.warn('outbox 消息已过期', {
+        count: result.expired.length,
+        ids: result.expired.map((item) => item.id),
+      });
+    }
+    if (result.dropped.length > 0) {
+      log.warn('outbox 超限，已丢弃最旧消息', {
+        count: result.dropped.length,
+        ids: result.dropped.map((item) => item.id),
+      });
+    }
+    if (result.quarantineExpired.length > 0 || result.quarantineDropped.length > 0) {
+      log.warn('隔离区已清理', {
+        expired: result.quarantineExpired.length,
+        dropped: result.quarantineDropped.length,
+      });
+    }
+    if (
+      result.expired.length > 0 ||
+      result.dropped.length > 0 ||
+      result.quarantineExpired.length > 0 ||
+      result.quarantineDropped.length > 0
+    ) {
+      persistState();
+    }
+  };
+
+  /**
+   * 补发某个用户的 outbox
+   * @param userId - 微信用户
+   * @param contextToken - 本次入站的上下文令牌
+   * @param budget - 本轮剩余额度
+   * @returns 补发结果与剩余额度
+   */
+  const flushForUser = async (
+    userId: string,
+    contextToken: string,
+    budget: number,
+  ): Promise<{ budgetLeft: number; stopReason: string; sent: number }> => {
+    const items = state.outbox
+      .filter((item) => item.toUserId === userId)
+      .sort((left, right) => left.createdAt - right.createdAt);
+    if (items.length === 0) return { budgetLeft: budget, stopReason: 'done', sent: 0 };
+
+    const result = await flushOutbox({
+      items,
+      budget,
+      policy: outboxPolicy(),
+      send: async (item) => {
+        try {
+          const response = await sendTextFn({
+            baseUrl: config.baseUrl,
+            token: config.token,
+            toUserId: userId,
+            text: item.text,
+            contextToken,
+          });
+          log.info('出站消息', {
+            category: 'sent',
+            kind: item.kind,
+            taskId: item.taskId ?? '',
+            messageId: response.message_id ?? '',
+            chars: item.text.length,
+            bytes: item.bytes,
+            attempts: item.failures + item.transientFailures,
+          });
+          return { kind: 'sent', messageId: response.message_id };
+        } catch (err) {
+          return toDeliveryOutcome(err);
+        }
+      },
+    });
+
+    const remainingIds = new Set(result.remaining.map((item) => item.id));
+    state.outbox = state.outbox.filter((item) => item.toUserId !== userId || remainingIds.has(item.id));
+
+    if (result.quarantined.length > 0) {
+      state.quarantine.push(...result.quarantined);
+      const maxQuarantine = Math.max(0, config.quarantineMaxItems);
+      if (state.quarantine.length > maxQuarantine) {
+        state.quarantine.splice(0, state.quarantine.length - maxQuarantine);
+      }
+      for (const item of result.quarantined) {
+        log.warn('消息已隔离', {
+          messageId: item.id,
+          taskId: item.taskId ?? '',
+          reason: item.reason,
+          failures: item.failures,
+          preview: item.preview,
+        });
+      }
+    }
+
+    if (result.stopReason === 'quota') {
+      state.quota.streak += 1;
+      state.quota.lastAt = now();
+      log.warn('下行额度耗尽', {
+        streak: state.quota.streak,
+        remaining: result.remaining.length,
+      });
+    } else if (result.sent > 0) {
+      state.quota.streak = 0;
+    }
+
+    if (result.stopReason === 'session_expired') {
+      log.error('微信会话过期（-14），停止循环，请重新执行 login');
+      deps.onSessionExpired?.();
+    }
+
+    persistState();
+    return { budgetLeft: result.budgetLeft, stopReason: result.stopReason, sent: result.sent };
+  };
+
+  /**
+   * 处理一条任务：补发欠账 → 调 Qoder → 回传
+   * @param userId - 微信用户
+   * @param text - 任务文本
+   * @param contextToken - 本次入站的上下文令牌
+   * @param attachments - 附件路径
+   * @param taskId - 可选任务 id
+   */
+  const processTask = async (
+    userId: string,
+    text: string,
+    contextToken: string,
+    attachments: string[] = [],
+    taskId?: string,
+  ): Promise<void> => {
+    const id = taskId ?? makeTaskId(now());
+    const session = new OutboundSession({
+      state,
+      toUserId: userId,
+      policy: outboxPolicy(),
+      maxChars: config.maxReplyChars,
+      budget: config.maxRepliesPerTurn,
+      send: async (body) => {
+        const response = await sendTextFn({
+          baseUrl: config.baseUrl,
+          token: config.token,
+          toUserId: userId,
+          text: body,
+          contextToken,
+        });
+        return { messageId: response.message_id };
+      },
+      now,
+    });
+    const typing = new TypingKeeper(userId, contextToken);
+    await typing.start();
+    try {
+      ingestPending(userId);
+      prune();
+
+      const flushed = await flushForUser(userId, contextToken, session.budget);
+      session.budget = flushed.budgetLeft;
+      if (flushed.stopReason === 'quota') session.quotaExhausted = true;
+      if (flushed.stopReason === 'session_expired') session.sessionExpired = true;
+
+      // 内置命令
+      const command = text.trim();
+      if (command === '/help') {
+        await session.sendSingle(formatHelp(), { kind: 'notice', queueOnFailure: true });
+        return;
+      }
+      if (command === '/reset') {
+        delete state.sessions[userId];
+        persistState();
+        await session.sendSingle('会话已重置，下一条消息将开启新的 Qoder 会话。', {
+          kind: 'notice',
+          queueOnFailure: true,
+        });
+        return;
+      }
+      if (command === '/status') {
+        const record = state.sessions[userId];
+        const lines = [
+          `工作目录：${workdir()}${config.cwd.trim() ? '' : '（全局）'}`,
+          `模型：${state.models[userId] ?? config.qoderModel ?? 'Auto（默认）'}`,
+          `Qoder 会话：${record ? record.sessionId : '（尚未创建）'}`,
+          `累计轮次：${record?.turns ?? 0}`,
+          `待补发：${state.outbox.filter((item) => item.toUserId === userId).length} 条`,
+          `隔离区：${state.quarantine.length} 条`,
+          `下行额度：${state.quota.streak > 0 ? `连续 ${state.quota.streak} 个窗口耗尽` : '正常'}`,
+        ];
+        await session.sendSingle(lines.join('\n'), { kind: 'notice', queueOnFailure: true });
+        return;
+      }
+
+      // 模型切换
+      const modelMatch = /^\/model(?:\s+([\s\S]*))?$/.exec(command);
+      if (modelMatch) {
+        const arg = (modelMatch[1] ?? '').trim();
+        if (!arg) {
+          const catalog = listModelsFn(config.qoderBin);
+          await session.sendSingle(formatModelList(catalog, state.models[userId] ?? config.qoderModel), {
+            kind: 'notice',
+            queueOnFailure: true,
+          });
+          return;
+        }
+        if (['default', 'auto', '默认'].includes(arg.toLowerCase())) {
+          delete state.models[userId];
+          persistState();
+          await session.sendSingle('已恢复默认模型（Auto）。', { kind: 'notice', queueOnFailure: true });
+          return;
+        }
+        const catalog = listModelsFn(config.qoderBin);
+        const resolved = resolveModel(arg, catalog);
+        if (!resolved.ok) {
+          await session.sendSingle(`未找到模型：${arg}\n发送 /model 查看可用列表。`, {
+            kind: 'notice',
+            queueOnFailure: true,
+          });
+          return;
+        }
+        state.models[userId] = resolved.option.id;
+        persistState();
+        await session.sendSingle(`已切换模型：${resolved.option.label}\n下一条任务起生效。`, {
+          kind: 'notice',
+          queueOnFailure: true,
+        });
+        return;
+      }
+
+      // 未知命令给出提示，避免拼错后静默落到 Qoder
+      if (isUnknownCommand(command)) {
+        await session.sendSingle(`未知命令：${command}\n发送 /help 查看可用命令。`, {
+          kind: 'notice',
+          queueOnFailure: true,
+        });
+        return;
+      }
+
+      // 调 Qoder
+      const record = state.sessions[userId];
+      const modelForTask = state.models[userId] ?? config.qoderModel;
+      const persona = loadPersonaFn(config.personaFile);
+      const nextSnapshot = nodeFingerprintFn();
+      const nodeChange = detectNodeChange(nodeSnapshot, nextSnapshot);
+      if (nodeChange) {
+        log.warn('Node 二进制已变化', {
+          reason: nodeChange,
+          path: nextSnapshot.path,
+          ino: nextSnapshot.ino,
+          version: nextSnapshot.version,
+        });
+        nodeSnapshot = nextSnapshot;
+      }
+
+      let taskHandle: { cancel: () => void; cancelled: boolean } | undefined;
+      log.info('开始执行 Qoder 任务', {
+        userId,
+        taskId: id,
+        sessionId: record?.sessionId ?? '(new)',
+        cwd: workdir(),
+        model: modelForTask || '(default)',
+        personaChars: persona.length,
+      });
+
+      let result = await runQoderFn({
+        prompt: text,
+        cwd: config.cwd.trim() ? config.cwd : undefined,
+        sessionId: record?.sessionId,
+        timeoutMs: config.qoderTimeoutMs,
+        bin: config.qoderBin,
+        permissionMode: config.permissionMode,
+        model: modelForTask || undefined,
+        memory: config.memoryEnabled,
+        appendSystemPrompt: persona || undefined,
+        attachments,
+        taskId: id,
+        errorMaxChars: config.userErrorMaxChars,
+        onStart: (cancel) => {
+          taskHandle = { cancel, cancelled: false };
+          runningTasks.set(userId, taskHandle);
+        },
+      });
+
+      // 用户通过 /stop 主动终止
+      if (taskHandle?.cancelled) {
+        log.info('任务已被用户停止', { userId, taskId: id });
+        runningTasks.delete(userId);
+        await session.sendSingle('任务已停止。', { kind: 'notice', queueOnFailure: false });
+        return;
+      }
+
+      // 会话不可续接时降级为新会话重试一次
+      if (!result.ok && record?.sessionId && /session|resume|not found/i.test(result.error ?? '')) {
+        log.warn('续接会话失败，改为新建会话重试', { error: result.error, taskId: id });
+        result = await runQoderFn({
+          prompt: text,
+          cwd: config.cwd.trim() ? config.cwd : undefined,
+          timeoutMs: config.qoderTimeoutMs,
+          bin: config.qoderBin,
+          permissionMode: config.permissionMode,
+          model: modelForTask || undefined,
+          memory: config.memoryEnabled,
+          appendSystemPrompt: persona || undefined,
+          attachments,
+          taskId: id,
+          errorMaxChars: config.userErrorMaxChars,
+          onStart: (cancel) => {
+            taskHandle = { cancel, cancelled: false };
+            runningTasks.set(userId, taskHandle);
+          },
+        });
+      }
+
+      if (result.sessionId) {
+        state.sessions[userId] = {
+          sessionId: result.sessionId,
+          updatedAt: Date.now(),
+          turns: (record?.turns ?? 0) + 1,
+        };
+        persistState();
+      }
+
+      log.info('任务结束', {
+        userId,
+        taskId: id,
+        ok: result.ok,
+        errorKind: result.errorKind ?? '',
+        exitCode: result.exitCode ?? null,
+        durationMs: result.durationMs,
+        sessionId: result.sessionId ?? record?.sessionId ?? '',
+        replyChars: result.ok ? result.text.length : 0,
+        model: result.modelUsed ?? modelForTask ?? '(default)',
+      });
+
+      if (result.ok) {
+        const replyText = result.text.trim() || '任务执行完成，但没有文本输出。';
+        await session.sendChunked(replyText, { kind: 'reply', taskId: id });
+      } else {
+        const reply =
+          result.error ??
+          buildUserErrorReply({
+            kind: result.errorKind ?? 'exit',
+            exitCode: result.exitCode,
+            detail: undefined,
+            maxChars: config.userErrorMaxChars,
+          });
+        await session.sendSingle(reply, { kind: 'error', queueOnFailure: true, taskId: id });
+      }
+    } finally {
+      runningTasks.delete(userId);
+      persistState();
+      await typing.stop();
     }
   };
 
@@ -163,7 +663,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
 
     /** 开始保活 */
     async start(): Promise<void> {
-      this.ticket = await getTypingTicket({
+      this.ticket = await getTypingTicketFn({
         baseUrl: config.baseUrl,
         token: config.token,
         userId: this.userId,
@@ -171,7 +671,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
       });
       if (!this.ticket) return;
       const beat = (): void => {
-        void sendTyping({
+        void sendTypingFn({
           baseUrl: config.baseUrl,
           token: config.token,
           userId: this.userId,
@@ -189,7 +689,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
       if (this.timer) clearInterval(this.timer);
       this.timer = undefined;
       if (!this.ticket) return;
-      await sendTyping({
+      await sendTypingFn({
         baseUrl: config.baseUrl,
         token: config.token,
         userId: this.userId,
@@ -204,227 +704,6 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
    * @returns 绝对路径
    */
   const workdir = (): string => config.cwd.trim() || os.homedir();
-
-  /**
-   * 处理一条任务：补发欠账 → 调 Qoder → 回传
-   * @param userId - 微信用户
-   * @param text - 任务文本
-   * @param contextToken - 本次入站的上下文令牌
-   */
-  const processTask = async (
-    userId: string,
-    text: string,
-    contextToken: string,
-    attachments: string[] = [],
-  ): Promise<void> => {
-    let budget = config.maxRepliesPerTurn;
-    const typing = new TypingKeeper(userId, contextToken);
-    await typing.start();
-    try {
-      // 0. 补发 CLI 侧暂存的主动提醒（qoder-wechat notify）
-      const pending = takePending();
-      if (pending.length > 0) {
-        log.info('补发主动提醒', { count: pending.length, userId });
-        for (const item of pending.filter((p) => p.toUserId !== userId)) {
-          state.outbox.push({ id: item.id, toUserId: item.toUserId, text: item.text, createdAt: item.createdAt, attempts: 0 });
-        }
-        for (const item of pending.filter((p) => p.toUserId === userId)) {
-          if (budget <= 0) {
-            state.outbox.push({ id: item.id, toUserId: item.toUserId, text: item.text, createdAt: item.createdAt, attempts: 0 });
-            continue;
-          }
-          if (await deliver(userId, contextToken, item.text)) {
-            budget -= 1;
-          } else {
-            state.outbox.push({ id: item.id, toUserId: item.toUserId, text: item.text, createdAt: item.createdAt, attempts: 1 });
-            break;
-          }
-        }
-        persistState();
-      }
-
-      // 1. 补发上一轮未送达的结果
-      for (const item of state.outbox.filter((o) => o.toUserId === userId)) {
-        if (budget <= 0) break;
-        if (await deliver(userId, contextToken, item.text)) {
-          state.outbox = state.outbox.filter((o) => o.id !== item.id);
-          budget -= 1;
-          persistState();
-        } else {
-          item.attempts += 1;
-          persistState();
-          break;
-        }
-      }
-
-      // 2. 内置命令
-      const command = text.trim();
-      if (command === '/help') {
-        await deliver(userId, contextToken, formatHelp());
-        return;
-      }
-      if (command === '/reset') {
-        delete state.sessions[userId];
-        persistState();
-        await deliver(userId, contextToken, '会话已重置，下一条消息将开启新的 Qoder 会话。');
-        return;
-      }
-      if (command === '/status') {
-        const record = state.sessions[userId];
-        const lines = [
-          `工作目录：${workdir()}${config.cwd.trim() ? '' : '（全局）'}`,
-          `模型：${state.models[userId] ?? config.qoderModel ?? 'Auto（默认）'}`,
-          `Qoder 会话：${record ? record.sessionId : '（尚未创建）'}`,
-          `累计轮次：${record?.turns ?? 0}`,
-          `待补发：${state.outbox.filter((o) => o.toUserId === userId).length} 条`,
-        ];
-        await deliver(userId, contextToken, lines.join('\n'));
-        return;
-      }
-
-      // 3. 模型切换
-      const modelMatch = /^\/model(?:\s+([\s\S]*))?$/.exec(command);
-      if (modelMatch) {
-        const arg = (modelMatch[1] ?? '').trim();
-        if (!arg) {
-          const catalog = listModels(config.qoderBin);
-          await deliver(userId, contextToken, formatModelList(catalog, state.models[userId] ?? config.qoderModel));
-          return;
-        }
-        if (['default', 'auto', '默认'].includes(arg.toLowerCase())) {
-          delete state.models[userId];
-          persistState();
-          await deliver(userId, contextToken, '已恢复默认模型（Auto）。');
-          return;
-        }
-        const catalog = listModels(config.qoderBin);
-        const resolved = resolveModel(arg, catalog);
-        if (!resolved.ok) {
-          await deliver(userId, contextToken, `未找到模型：${arg}\n发送 /model 查看可用列表。`);
-          return;
-        }
-        state.models[userId] = resolved.option.id;
-        persistState();
-        await deliver(userId, contextToken, `已切换模型：${resolved.option.label}\n下一条任务起生效。`);
-        return;
-      }
-
-      // 未知命令给出提示，避免拼错后静默落到 Qoder
-      if (isUnknownCommand(command)) {
-        await deliver(userId, contextToken, `未知命令：${command}\n发送 /help 查看可用命令。`);
-        return;
-      }
-
-      // 4. 调 Qoder
-      const record = state.sessions[userId];
-      const modelForTask = state.models[userId] ?? config.qoderModel;
-      // 每条任务重新读取人设，改文件后下一条消息即生效
-      const persona = loadPersona(config.personaFile);
-      let taskHandle: { cancel: () => void; cancelled: boolean } | undefined;
-      log.info('开始执行 Qoder 任务', {
-        userId,
-        sessionId: record?.sessionId ?? '(new)',
-        cwd: workdir(),
-        model: modelForTask || '(default)',
-        personaChars: persona.length,
-      });
-      let result = await runQoder({
-        prompt: text,
-        cwd: config.cwd.trim() ? config.cwd : undefined,
-        sessionId: record?.sessionId,
-        timeoutMs: config.qoderTimeoutMs,
-        bin: config.qoderBin,
-        permissionMode: config.permissionMode,
-        model: modelForTask || undefined,
-        memory: config.memoryEnabled,
-        appendSystemPrompt: persona || undefined,
-        attachments,
-        onStart: (cancel) => {
-          taskHandle = { cancel, cancelled: false };
-          runningTasks.set(userId, taskHandle);
-        },
-      });
-
-      // 用户通过 /stop 主动终止
-      if (taskHandle?.cancelled) {
-        log.info('任务已被用户停止', { userId });
-        runningTasks.delete(userId);
-        await deliver(userId, contextToken, '任务已停止。');
-        return;
-      }
-
-      // 会话不可续接时降级为新会话重试一次
-      if (!result.ok && record?.sessionId && /session|resume|not found/i.test(result.error ?? '')) {
-        log.warn('续接会话失败，改为新建会话重试', { error: result.error });
-        result = await runQoder({
-          prompt: text,
-          cwd: config.cwd.trim() ? config.cwd : undefined,
-          timeoutMs: config.qoderTimeoutMs,
-          bin: config.qoderBin,
-          permissionMode: config.permissionMode,
-          model: modelForTask || undefined,
-          memory: config.memoryEnabled,
-          appendSystemPrompt: persona || undefined,
-          attachments,
-          onStart: (cancel) => {
-            taskHandle = { cancel, cancelled: false };
-            runningTasks.set(userId, taskHandle);
-          },
-        });
-      }
-
-      if (result.sessionId) {
-        state.sessions[userId] = {
-          sessionId: result.sessionId,
-          updatedAt: Date.now(),
-          turns: (record?.turns ?? 0) + 1,
-        };
-        persistState();
-      }
-
-      const replyText = result.ok
-        ? result.text.trim() || '任务执行完成，但没有文本输出。'
-        : `执行失败：${result.error ?? '未知错误'}`;
-      log.info('任务结束', {
-        userId,
-        ok: result.ok,
-        durationMs: result.durationMs,
-        sessionId: result.sessionId ?? record?.sessionId ?? '',
-        replyChars: replyText.length,
-        model: result.modelUsed ?? modelForTask ?? '(default)',
-      });
-
-      // 5. 分片回传，超出额度的进入 outbox
-      const chunks = chunkText(replyText, config.maxReplyChars);
-      let sentCount = 0;
-      for (const chunk of chunks) {
-        if (budget <= 0) break;
-        if (await deliver(userId, contextToken, chunk)) {
-          budget -= 1;
-          sentCount += 1;
-        } else {
-          break;
-        }
-      }
-      const remaining = chunks.slice(sentCount);
-      if (remaining.length > 0) {
-        for (const chunk of remaining) {
-          state.outbox.push({
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            toUserId: userId,
-            text: chunk,
-            createdAt: Date.now(),
-            attempts: 0,
-          });
-        }
-        persistState();
-        log.warn('超出本轮额度，剩余内容进入补发队列', { count: remaining.length });
-      }
-    } finally {
-      runningTasks.delete(userId);
-      await typing.stop();
-    }
-  };
 
   /**
    * 处理一条入站消息
@@ -509,7 +788,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
         handle.cancel();
         log.info('收到停止指令，正在终止任务', { from });
       } else if (stopToken) {
-        await deliver(from, stopToken, '当前没有正在执行的任务。');
+        await sendControl(from, stopToken, '当前没有正在执行的任务。');
       }
       return;
     }
@@ -528,7 +807,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
       if (!isMedia) continue;
       mediaIndex += 1;
       try {
-        const saved = await downloadItemMedia(item, msgId, mediaIndex, config.inboxDir);
+        const saved = await downloadMediaFn(item, msgId, mediaIndex, config.inboxDir);
         if (saved) media.push(saved);
         else failures.push(describeItem(item));
       } catch (err) {
@@ -548,7 +827,7 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
     if (voiceWithoutText && !text && attachments.length === 0) {
       log.info('语音无转写，已直接反馈', { from });
       if (contextToken) {
-        await deliver(from, contextToken, '这条语音没有转写，我没法听到内容。请重发一次，或改用文字/图片。');
+        await sendControl(from, contextToken, '这条语音没有转写，我没法听到内容。请重发一次，或改用文字/图片。');
       }
       return;
     }
@@ -572,17 +851,162 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
     enqueue(from, () => processTask(from, prompt, contextToken, attachments));
   };
 
+  /**
+   * 取消所有进行中的 Qoder 任务
+   */
+  const cancelAllTasks = (): void => {
+    for (const task of runningTasks.values()) {
+      task.cancelled = true;
+      task.cancel();
+    }
+  };
+
+  /**
+   * 等待当前排队的任务全部结束
+   * @returns 全部任务结束
+   */
+  const waitForIdle = async (): Promise<void> => {
+    while (queues.size > 0) {
+      await Promise.all([...queues.values()]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+
+  return {
+    handleInbound,
+    processTask,
+    cancelAllTasks,
+    waitForIdle,
+    prune,
+    getConfig: () => config,
+    getState: () => state,
+  };
+}
+
+/**
+ * 生成预检失败告警
+ * @param result - 预检结果
+ * @returns 单条短告警
+ */
+export function formatPreflightAlert(result: PreflightResult): string {
+  const kinds = result.failures.map((failure) => failure.kind).join(', ') || 'unknown';
+  return `本机 Qoder 环境异常：${kinds}。已记录日志，请检查 Node / qodercli。`.slice(0, 300);
+}
+
+/**
+ * 启动常驻桥接服务
+ * @param overrides - 覆盖配置文件中的字段（不落盘）
+ * @param deps - 可注入依赖，便于单测
+ * @returns 运行句柄
+ */
+export async function runService(
+  overrides: Partial<Config> = {},
+  deps: ServiceDeps = {},
+): Promise<BridgeHandle> {
+  const pruneDiagnosticsFn = deps.pruneDiagnostics ?? pruneDiagnostics;
+  const pruneInboxFn = deps.pruneInbox ?? pruneInbox;
+  const loginFn = deps.login ?? login;
+  const notifyClientFn = deps.notifyClient ?? notifyClient;
+  const getUpdatesFn = deps.getUpdates ?? getUpdates;
+  const writeRunInfoFn = deps.writeRunInfo ?? writeRunInfo;
+  const clearRunInfoFn = deps.clearRunInfo ?? clearRunInfo;
+  const runPreflightFn = deps.runPreflight ?? runPreflight;
+  const sendTextFn = deps.sendText ?? sendText;
+
+  ensureDirs();
+  let config: Config = { ...loadConfig(), ...overrides };
+  const state: State = loadState();
+  try {
+    pruneDiagnosticsFn(config.diagnosticRetentionDays);
+  } catch (err) {
+    log.warn('诊断清理失败', { error: String(err) });
+  }
+  try {
+    pruneInboxFn(config.inboxDir);
+  } catch {
+    // 清理失败不影响启动
+  }
+  let running = true;
+  /** 用于中断长轮询，保证 Ctrl+C 后立即退出 */
+  const abortController = new AbortController();
+
+  if (!config.token) {
+    log.warn('尚未登录微信，先执行扫码登录');
+    const result = await loginFn();
+    log.info(result.message);
+    if (!result.connected) throw new Error('微信登录未完成');
+    config = { ...loadConfig(), ...overrides };
+  }
+
+  const runtime = createBridgeRuntime(config, state, {
+    ...deps,
+    onSessionExpired: () => {
+      running = false;
+      deps.onSessionExpired?.();
+    },
+  });
+  runtime.prune();
+
+  const preflight = await runPreflightFn({
+    qoderBin: config.qoderBin,
+    versionTimeoutMs: config.preflightVersionTimeoutMs,
+  });
+  if (preflight.ok) {
+    log.info('启动预检通过', {
+      nodeVersion: preflight.node.version,
+      nodePath: preflight.node.execPath,
+      qoderPath: preflight.qodercli?.path ?? '',
+      qoderVersion: preflight.qodercli?.version ?? '',
+    });
+  } else {
+    log.error('启动预检失败', {
+      failures: preflight.failures.map((failure) => failure.kind),
+      nodeVersion: preflight.node.version,
+      nodePath: preflight.node.execPath,
+      qoderPath: preflight.qodercli?.path ?? '',
+    });
+    const owner = runtime.getConfig().ownerUserId;
+    const token = owner ? runtime.getState().contextTokens[owner] ?? '' : '';
+    if (token) {
+      try {
+        await sendTextFn({
+          baseUrl: runtime.getConfig().baseUrl,
+          token: runtime.getConfig().token,
+          toUserId: owner,
+          text: formatPreflightAlert(preflight),
+          contextToken: token,
+        });
+      } catch (err) {
+        log.warn('预检告警发送失败', { error: String(err) });
+      }
+    }
+  }
+
+  log.info('桥接服务启动', {
+    baseUrl: config.baseUrl,
+    cwd: config.cwd,
+    permissionMode: config.permissionMode,
+    ownerUserId: config.ownerUserId || '(未设置)',
+    token: config.token ? '***' : '(empty)',
+  });
+  writeRunInfoFn();
+
   /** 主循环 */
   const runLoop = async (): Promise<void> => {
-    await notifyClient({ baseUrl: config.baseUrl, token: config.token, action: 'start' });
+    await notifyClientFn({
+      baseUrl: runtime.getConfig().baseUrl,
+      token: runtime.getConfig().token,
+      action: 'start',
+    });
     let pollTimeout = config.pollTimeoutMs;
     let backoff = 1_000;
     while (running) {
       try {
-        const resp = await getUpdates({
-          baseUrl: config.baseUrl,
-          token: config.token,
-          getUpdatesBuf: state.getUpdatesBuf,
+        const current = runtime.getConfig();
+        const resp = await getUpdatesFn({
+          baseUrl: current.baseUrl,
+          token: current.token,
+          getUpdatesBuf: runtime.getState().getUpdatesBuf,
           timeoutMs: pollTimeout + 5_000,
           signal: abortController.signal,
         });
@@ -603,11 +1027,11 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
         }
         backoff = 1_000;
         if (resp.get_updates_buf) {
-          state.getUpdatesBuf = resp.get_updates_buf;
-          persistState();
+          runtime.getState().getUpdatesBuf = resp.get_updates_buf;
+          saveState(runtime.getState());
         }
         for (const msg of resp.msgs ?? []) {
-          await handleInbound(msg);
+          await runtime.handleInbound(msg);
         }
       } catch (err) {
         log.error('轮询异常，退避重试', { error: String(err), backoff });
@@ -615,37 +1039,11 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
         backoff = Math.min(backoff * 2, 10_000);
       }
     }
-    await notifyClient({ baseUrl: config.baseUrl, token: config.token, action: 'stop' });
-  };
-
-  if (!config.token) {
-    log.warn('尚未登录微信，先执行扫码登录');
-    const result = await login();
-    log.info(result.message);
-    if (!result.connected) throw new Error('微信登录未完成');
-    config = { ...loadConfig(), ...overrides };
-  }
-
-  log.info('桥接服务启动', {
-    baseUrl: config.baseUrl,
-    cwd: config.cwd,
-    permissionMode: config.permissionMode,
-    ownerUserId: config.ownerUserId || '(未设置)',
-    token: config.token ? '***' : '(empty)',
-  });
-  writeRunInfo();
-
-  /**
-   * 取消所有进行中的 Qoder 任务
-   *
-   * 长轮询的 abortController 管不到子进程，不显式取消的话父进程退出后
-   * qodercli 会变成孤儿继续执行，跑完还可能往微信回消息。
-   */
-  const cancelAllTasks = (): void => {
-    for (const task of runningTasks.values()) {
-      task.cancelled = true;
-      task.cancel();
-    }
+    await notifyClientFn({
+      baseUrl: runtime.getConfig().baseUrl,
+      token: runtime.getConfig().token,
+      action: 'stop',
+    });
   };
 
   let signalCount = 0;
@@ -653,28 +1051,37 @@ export async function runService(overrides: Partial<Config> = {}): Promise<Bridg
     signalCount += 1;
     if (signalCount > 1) {
       log.warn('再次收到停止信号，立即退出');
-      persistState();
+      saveState(runtime.getState());
       process.exit(130);
     }
     log.info('收到停止信号，准备退出');
     running = false;
-    cancelAllTasks();
+    runtime.cancelAllTasks();
     abortController.abort();
-    persistState();
+    saveState(runtime.getState());
+  };
+  /** 移除信号监听，避免同进程多次启动时累积 */
+  const removeSignals = (): void => {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
 
   void runLoop()
     .catch((err) => log.error('主循环异常退出', { error: String(err) }))
-    .finally(() => clearRunInfo(process.pid));
+    .finally(() => {
+      removeSignals();
+      clearRunInfoFn(process.pid);
+    });
 
   return {
     stop: (): void => {
       running = false;
-      cancelAllTasks();
+      runtime.cancelAllTasks();
       abortController.abort();
+      removeSignals();
     },
-    config,
+    config: runtime.getConfig(),
   };
 }

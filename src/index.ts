@@ -12,6 +12,7 @@ export {
   loadConfig,
   loadState,
   migrateLegacyConfig,
+  normalizeState,
   readRunInfo,
   runInfoPath,
   saveConfig,
@@ -20,7 +21,16 @@ export {
   statePath,
   writeRunInfo,
 } from './config.js';
-export type { Config, OutboxItem, RunInfo, SessionRecord, State } from './config.js';
+export type {
+  Config,
+  OutboxItem,
+  OutboxItemKind,
+  QuarantineItem,
+  QuotaState,
+  RunInfo,
+  SessionRecord,
+  State,
+} from './config.js';
 
 export { login } from './weixin/login.js';
 export type { LoginResult } from './weixin/login.js';
@@ -29,12 +39,46 @@ export type { LoginResult } from './weixin/login.js';
 export * as weixin from './weixin/client.js';
 /** iLink 协议类型与常量 */
 export * as protocol from './weixin/types.js';
+export { BridgeSendError, classifySendError } from './weixin/errors.js';
+export type { SendFailureKind } from './weixin/errors.js';
 
-export { isAlive, launchdLabel, stopService } from './bridge/lifecycle.js';
-export type { StopOutcome } from './bridge/lifecycle.js';
+export {
+  findLaunchdServices,
+  formatStopOutcome,
+  isAlive,
+  isBridgeProcess,
+  launchdLabel,
+  listBridgeProcesses,
+  parseLaunchctlList,
+  parsePsOutput,
+  planStop,
+  stopExitCode,
+  stopService,
+} from './bridge/lifecycle.js';
+export type {
+  BridgeProcess,
+  LaunchdService,
+  StopDecision,
+  StopDeps,
+  StopOutcome,
+} from './bridge/lifecycle.js';
 
 export { cleanEnv, runQoder } from './bridge/qoder.js';
 export type { QoderRunInput, QoderRunResult } from './bridge/qoder.js';
+export { flushOutbox, pruneOutbox, pushOutbox, quarantineItem } from './bridge/outbox.js';
+export type { DeliveryOutcome, FlushResult, OutboxPolicy, PruneResult } from './bridge/outbox.js';
+export { buildUserErrorReply, truncateGraphemes } from './bridge/failure.js';
+export type { QoderErrorKind } from './bridge/failure.js';
+export { detectNodeChange, nodeFingerprint, runPreflight } from './bridge/preflight.js';
+export type { NodeFingerprint, PreflightDeps, PreflightFailureKind, PreflightResult } from './bridge/preflight.js';
+export { OutboundSession } from './bridge/outbound.js';
+export type {
+  EnqueueOptions,
+  OutboundSend,
+  OutboundSendResult,
+  OutboundSessionOptions,
+  SendSingleOutcome,
+} from './bridge/outbound.js';
 export { chunkText } from './bridge/reply.js';
 export { runService } from './bridge/service.js';
 export type { BridgeHandle } from './bridge/service.js';
@@ -46,6 +90,12 @@ export { COMMANDS, formatHelp, isUnknownCommand } from './commands.js';
 export type { CommandDef } from './commands.js';
 
 export { log, setLevel } from './log.js';
+
+export { buildStatusLines, formatAge, formatBytes } from './status.js';
+export type { StatusContext } from './status.js';
+
+export { pruneDiagnostics, redactSensitive, writeDiagnostic } from './diagnostics.js';
+export type { DiagnosticInput, DiagnosticOptions } from './diagnostics.js';
 
 export { notify, pendingFilePath, takePending } from './notify.js';
 export type { NotifyResult, PendingNotice } from './notify.js';

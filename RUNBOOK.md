@@ -21,6 +21,7 @@
 | 状态（游标、会话映射、补发队列） | `~/.local/state/qoder-wechat-bridge/state.json` |
 | 待补发提醒（notify 排队） | `~/.local/state/qoder-wechat-bridge/pending-notifications.jsonl` |
 | 日志 | `~/.local/state/qoder-wechat-bridge/logs/bridge-YYYY-MM-DD.jsonl` |
+| 失败诊断（qodercli 输出，7 天） | `~/.local/state/qoder-wechat-bridge/logs/diagnostics/YYYY-MM-DD/` |
 | 登录二维码 | `~/.local/state/qoder-wechat-bridge/wechat-qr.png` |
 | 入站附件缓存（7 天） | `~/.local/state/qoder-wechat-bridge/inbox/` |
 | 无 TTY 时的校验码 | `~/.local/state/qoder-wechat-bridge/verify-code.txt` |
@@ -36,7 +37,7 @@ node dist/cli.js run
 node dist/cli.js run --cwd ~/projects/my-app
 ```
 
-停止：`Ctrl+C`，或另开终端执行 `node dist/cli.js stop`。`stop` 会取消正在执行的 qodercli 任务并等它落定，实测约 2 秒退出；进程由 launchd 之类监督器托管时它不发信号（发了会被重新拉起），只打印要执行的 `launchctl bootout` 命令。
+停止：`Ctrl+C`，或另开终端执行 `node dist/cli.js stop`。手动实例会收到 SIGTERM，`stop` 会取消正在执行的 qodercli 任务并等它落定（正常退出 0，超时 1）；launchd 托管时不发信号（发了会被 KeepAlive 重新拉起），而是打印 `launchctl bootout`、验证、恢复和兜底命令，并返回 2。运行记录失效时会继续扫进程和 launchd 标签；多实例只报告冲突并列出每个 pid 的 `kill -TERM` 命令。
 
 ### Windows
 
@@ -89,9 +90,14 @@ node dist/cli.js run --permission-mode dont_ask
 | `Not logged in · Please run /login` | qodercli 未登录 | `qodercli login`，浏览器授权 |
 | `SyntaxError: Invalid regular expression flags` | node 仍是 v16 | `n 22` |
 | 扫码后 `binded_redirect` | 该微信号已绑过其它 OpenClaw 形态机器人 | 先解绑，或换号 |
-| 收消息正常但回复失败 `ret=-2` | context_token 过期 / 下行额度耗尽 | 属通道限制；结果会进补发队列，下次入站重试 |
+| 收消息正常但回复失败 `ret=-2` | 下行额度耗尽 / context_token 失效 | 消息保留在 outbox，下一次入站优先补发；不计数、不隔离。连续出现时看 `status` 的额度告警 |
+| qodercli 异常退出 / 输出无法解析 | 子进程崩溃、输出不是 JSON | 只回一条短错误；诊断在 `logs/diagnostics/`，单文件 ≤64KB |
+| 隔离区有消息 | 某条消息连续永久失败，已停止自动补发 | `status` 查看数量；手动恢复需停服编辑 `state.json` 的 `quarantine`，或等 7 天过期 |
+| outbox 超限 / 过期 | 补发队列达到 200 条或 24 小时 | 查看日志中的 `outbox 超限` / `消息已过期`，旧消息会被丢弃 |
+| `stop` 退出码 2 | launchd 托管，未真正停止 | 执行它打印的 `launchctl bootout gui/<uid>/<label>` |
+| `stop` 退出码 1 | 发出信号但进程未退出 | 再执行一次 `stop`，第二次信号会立即结束 |
 | 语音只收到"没有转写"的提示 | 平台未提供该条语音的转写 | 让用户重发或改用文字；要 100% 覆盖需接 ASR |
-| `stop` 回"没有运行记录" | 服务是旧版本启的，没写过 `run.json` | 全局安装跑的是 `pkill -f "qoder-wechat run"`，仓库内跑的用 `pkill -f "cli.js run"`；之后由新版启动即可正常用 stop |
+| `stop` 回"没有运行记录" | 0.1.x 旧版本只依赖 `run.json` | 0.2.0 会继续扫进程和 launchd 标签；仍失败时用 `pgrep -fl "qoder-wechat run"` / `launchctl list` 手工确认 |
 | 日志 `-14` | 微信会话过期 | 重新 `login`；不要高频重登（会触发风控） |
 | `npm error EACCES ~/.npm/_cacache` | 缓存目录有 root 所有的文件 | 用 `--cache ./.npm-cache`，或自行修复缓存权限 |
 | `install-scripts` 拦截 esbuild | npm 11 默认禁止 postinstall | 本项目不依赖 tsx/esbuild，用 `tsc` 构建即可 |
@@ -103,13 +109,23 @@ node dist/cli.js run --permission-mode dont_ask
 tail -f ~/.local/state/qoder-wechat-bridge/logs/bridge-$(date +%F).jsonl
 ```
 
-验收标准（v0.1）：
+验收标准（0.2.0）：
 
 1. 微信发一条文本，10 秒内日志出现「收到授权消息」；
 2. 若任务较长，微信侧可见「正在输入」；
-3. 结果在 ≤9 条消息内回传，单条 ≤2000 字；
+3. 结果在 ≤9 条消息内回传，单条 ≤2000 字；超出进入 outbox，下一次入站优先补发；
 4. 第二条消息能延续上下文（`state.json` 中同一 `sessionId`）；
-5. 发送 `/status` 能返回工作目录与会话 id。
+5. `/status` 与 `qoder-wechat status` 能看到 outbox、隔离区和额度状态；
+6. qodercli 崩溃时只收到一条 ≤300 字短错误，诊断文件 ≤64KB；
+7. launchd 托管下 `stop` 打印 bootout 命令并返回 2。
+
+0.2.0 真机验收（2026-11-03）：
+
+- 正常收发：1 条 18 字回复，队列 0；
+- 坏 qodercli：`errorKind=spawn`，单条 80 字错误，诊断 150B；
+- outbox：606 字回复只发 1 段，10 条入队；重启后仍为 10 条；下一轮先补 9 条，剩 2 条；再发一条后归零；
+- stop：launchd 下打印 bootout 并返回 2；手动实例 603ms / 604ms 退出并返回 0；
+- 验收中发现并修复：`stop` 曾把包含 `node dist/cli.js run` 的 shell 包装命令误当成第二实例；已改为按 argv 首段匹配并加回归用例。
 
 ## 7. 安全
 
