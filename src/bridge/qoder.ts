@@ -7,6 +7,7 @@ import os from 'node:os';
 import { log } from '../log.js';
 import { writeDiagnostic } from '../diagnostics.js';
 import { buildUserErrorReply, type QoderErrorKind } from './failure.js';
+import { classifyQoderError, type QoderErrorClass, type QoderSemanticFields } from './error-class.js';
 
 /** 一次调用的输入 */
 export interface QoderRunInput {
@@ -43,8 +44,14 @@ export interface QoderRunResult {
   /** 实际使用的模型（取自 modelUsage 的键，用于验证切换是否生效） */
   modelUsed?: string;
   errorKind?: QoderErrorKind;
+  /** 业务语义类别；失败时必有值 */
+  errorClass?: QoderErrorClass;
+  /** 归一化后的 error_code，用于日志、诊断与 status */
+  errorCode?: string;
   /** 短错误提示，不超过 errorMaxChars */
   error?: string;
+  /** 内部信号原文（errors[0] / error_message / result），仅供续接降级匹配，永不直达用户 */
+  errorDetail?: string;
   exitCode?: number | null;
   diagnosticPath?: string;
   durationMs: number;
@@ -56,6 +63,11 @@ interface ParsedResult {
   is_error: boolean;
   session_id?: string;
   model?: string;
+  /** 以下语义字段原样透传，类型归一交给 classifyQoderError */
+  stop_reason?: unknown;
+  error_code?: unknown;
+  error_message?: unknown;
+  errors?: unknown;
 }
 
 /** 输出上限，防止异常输出撑爆内存 */
@@ -120,6 +132,10 @@ function parseResult(raw: string): ParsedResult | null {
           is_error: parsed.is_error === true,
           session_id: typeof parsed.session_id === 'string' ? parsed.session_id : undefined,
           model,
+          stop_reason: parsed.stop_reason,
+          error_code: parsed.error_code,
+          error_message: parsed.error_message,
+          errors: parsed.errors,
         };
       }
     } catch {
@@ -127,6 +143,22 @@ function parseResult(raw: string): ParsedResult | null {
     }
   }
   return null;
+}
+
+/**
+ * 从解析结果里取出业务语义字段
+ * @param parsed - 解析后的 result 对象
+ * @returns 交给 classifyQoderError 归一的语义字段
+ */
+function semanticFields(parsed: ParsedResult): QoderSemanticFields {
+  return {
+    errorCode: parsed.error_code,
+    errorMessage: parsed.error_message,
+    errors: parsed.errors,
+    stopReason: parsed.stop_reason,
+    isError: parsed.is_error,
+    result: parsed.result,
+  };
 }
 
 /**
@@ -200,8 +232,8 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
 
     /**
      * 落定失败结果，只允许生效一次
-     * @param kind - 失败类别
-     * @param opts - 诊断与结果字段
+     * @param kind - 传输层失败类别
+     * @param opts - 诊断与结果字段；semantic 为 result 行里的业务语义字段
      */
     const settleFailure = (
       kind: QoderErrorKind,
@@ -210,6 +242,7 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
         detail?: string;
         sessionId?: string;
         modelUsed?: string;
+        semantic?: QoderSemanticFields;
       } = {},
     ): void => {
       if (settled) return;
@@ -220,11 +253,15 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
       const stdout = readStdout();
       const stderr = readStderr();
       const exitCode = opts.exitCode ?? null;
+      // 命名避开 opts.detail：后者是传输层错误原文，前者是语义信号，混用会直接把原文送进用户提示
+      const { errorClass, errorCode, detail: errorDetail } = classifyQoderError(opts.semantic ?? {});
       const diagnostic = writeDiagnostic(
         {
           taskId: input.taskId,
           sessionId: opts.sessionId ?? input.sessionId,
           kind,
+          errorClass,
+          errorCode,
           exitCode,
           durationMs,
           stdout,
@@ -234,6 +271,7 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
       );
       const error = buildUserErrorReply({
         kind,
+        errorClass,
         exitCode,
         detail: opts.detail,
         timeoutMs: input.timeoutMs,
@@ -245,7 +283,10 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
         sessionId: opts.sessionId ?? input.sessionId,
         modelUsed: opts.modelUsed,
         errorKind: kind,
+        errorClass,
+        errorCode,
         error,
+        errorDetail,
         exitCode,
         diagnosticPath: diagnostic.path || undefined,
         durationMs,
@@ -290,11 +331,13 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
         settleFailure('parse', { exitCode: code });
         return;
       }
+      const semantic = semanticFields(parsed);
       if (code !== 0) {
         settleFailure('exit', {
           exitCode: code,
           sessionId: parsed.session_id,
           modelUsed: parsed.model,
+          semantic,
         });
         return;
       }
@@ -304,6 +347,19 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
           detail: parsed.result,
           sessionId: parsed.session_id,
           modelUsed: parsed.model,
+          semantic,
+        });
+        return;
+      }
+      // 进程正常退出且 is_error 为假，但 error_code 表明输出被截断：
+      // 半截答案一旦按成功下发，用户会当成完整回答，因此仍判失败（需求 2.1）
+      if (classifyQoderError(semantic).errorClass === 'output_limit') {
+        settleFailure('is_error', {
+          exitCode: code,
+          detail: parsed.result,
+          sessionId: parsed.session_id,
+          modelUsed: parsed.model,
+          semantic,
         });
         return;
       }

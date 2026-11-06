@@ -3,6 +3,7 @@
  * @module status
  */
 import type { Config, State } from './config.js';
+import { ERROR_CLASS_LABEL } from './bridge/error-class.js';
 
 /** status 上下文 */
 export interface StatusContext {
@@ -58,6 +59,16 @@ export function buildStatusLines(config: Config, state: State, context: StatusCo
     state.quota.streak > 0
       ? `下行额度：上次 ret=-2 于 ${new Date(state.quota.lastAt).toLocaleString('zh-CN', { hour12: false })}（连续 ${state.quota.streak} 个窗口）`
       : '下行额度：正常';
+  // 「下行额度」是微信侧 ret=-2，与 lastFailure 里的 model_quota（模型侧额度）无关，两者必须分行且字面可区分
+  const failure = state.lastFailure;
+  const failureLine = failure
+    ? `最近失败：${ERROR_CLASS_LABEL[failure.errorClass]}（${failure.errorClass}${
+        failure.errorCode ? `｜error_code=${failure.errorCode}` : ''
+      }｜退出码 ${failure.exitCode === null ? '未知' : failure.exitCode}）于 ${new Date(failure.at).toLocaleString(
+        'zh-CN',
+        { hour12: false },
+      )}｜任务 ${failure.taskId}`
+    : '最近失败：无';
 
   return [
     `配置：${context.configFile}`,
@@ -74,5 +85,6 @@ export function buildStatusLines(config: Config, state: State, context: StatusCo
     queueLine,
     `隔离区：${state.quarantine.length} 条`,
     quotaLine,
+    failureLine,
   ];
 }

@@ -116,4 +116,91 @@ describe('buildStatusLines', () => {
     expect(lines).toContain('工作目录：/work');
     expect(lines).toContain('白名单');
   });
+
+  it('应该在无失败记录时显示最近失败为无', () => {
+    const lines = buildStatusLines(makeConfig(), makeState(), context);
+
+    expect(lines).toContain('最近失败：无');
+  });
+
+  it('应该展示最近失败的类别、error_code、退出码、时间与任务 id', () => {
+    const state = makeState({
+      lastFailure: {
+        kind: 'exit',
+        errorClass: 'model_quota',
+        errorCode: '110',
+        exitCode: 1,
+        at: new Date(2026, 10, 5, 23, 27, 51).getTime(),
+        taskId: 'mw3p970m-bt2wwl',
+      },
+    });
+    const line = buildStatusLines(makeConfig(), state, context).find((item) => item.startsWith('最近失败：'));
+
+    expect(line).toContain('模型额度已用尽');
+    expect(line).toContain('model_quota');
+    expect(line).toContain('error_code=110');
+    expect(line).toContain('退出码 1');
+    expect(line).toContain('任务 mw3p970m-bt2wwl');
+    expect(line).toMatch(/于 \d{4}\/11\/5 23:27:51/);
+  });
+
+  it('应该在 error_code 缺失时整段省略且不留下多余分隔符', () => {
+    const state = makeState({
+      lastFailure: { kind: 'timeout', errorClass: 'unknown', exitCode: null, at: Date.now(), taskId: 't1' },
+    });
+    const line = buildStatusLines(makeConfig(), state, context).find((item) => item.startsWith('最近失败：'));
+
+    expect(line).not.toContain('error_code=');
+    expect(line).not.toContain('｜｜');
+    expect(line).toContain('未归类');
+    expect(line).toContain('退出码 未知');
+  });
+
+  it('应该让四个语义类别各自映射到中文短语', () => {
+    const labels = {
+      model_quota: '模型额度已用尽',
+      output_limit: '回答被截断',
+      auth: '凭据已失效',
+      unknown: '未归类',
+    } as const;
+
+    for (const [errorClass, label] of Object.entries(labels)) {
+      const state = makeState({
+        lastFailure: { kind: 'exit', errorClass, exitCode: 1, at: Date.now(), taskId: 't' },
+      });
+      const line = buildStatusLines(makeConfig(), state, context).find((item) => item.startsWith('最近失败：'));
+      expect(line).toContain(label);
+    }
+  });
+
+  it('应该让最近失败与下行额度分成两行且字面可区分', () => {
+    const state = makeState({
+      quota: { streak: 2, lastAt: Date.now() },
+      lastFailure: {
+        kind: 'exit',
+        errorClass: 'model_quota',
+        errorCode: '110',
+        exitCode: 1,
+        at: Date.now(),
+        taskId: 't1',
+      },
+    });
+    const lines = buildStatusLines(makeConfig(), state, context);
+    const quotaIndex = lines.findIndex((item) => item.startsWith('下行额度：'));
+    const failureIndex = lines.findIndex((item) => item.startsWith('最近失败：'));
+
+    expect(quotaIndex).toBeGreaterThanOrEqual(0);
+    expect(failureIndex).toBe(quotaIndex + 1);
+    expect(lines[quotaIndex]).toContain('ret=-2');
+    expect(lines[quotaIndex]).not.toContain('model_quota');
+    expect(lines[failureIndex]).not.toContain('ret=-2');
+  });
+
+  it('应该保留一期既有的全部状态行', () => {
+    const lines = buildStatusLines(makeConfig(), makeState(), context).join('\n');
+
+    for (const prefix of ['配置：', '状态：', 'iLink：', 'Token：', '机器人 ID：', '授权账号：', '会话数：', '隔离区：']) {
+      expect(lines).toContain(prefix);
+    }
+  });
 });

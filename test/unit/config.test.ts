@@ -56,6 +56,7 @@ describe('配置默认值与路径', () => {
     expect(DEFAULT_CONFIG.quarantineMaxItems).toBe(500);
     expect(DEFAULT_CONFIG.quarantineTtlMs).toBe(604_800_000);
     expect(DEFAULT_CONFIG.userErrorMaxChars).toBe(300);
+    expect(DEFAULT_CONFIG.errorDedupWindowMs).toBe(600_000);
     expect(DEFAULT_CONFIG.diagnosticMaxBytes).toBe(65_536);
     expect(DEFAULT_CONFIG.diagnosticRetentionDays).toBe(7);
     expect(DEFAULT_CONFIG.preflightVersionTimeoutMs).toBe(5_000);
@@ -116,6 +117,7 @@ describe('配置加载与保存', () => {
     process.env.QWB_QUARANTINE_MAX = '20';
     process.env.QWB_QUARANTINE_TTL_MS = '3000';
     process.env.QWB_USER_ERROR_CHARS = '200';
+    process.env.QWB_ERROR_DEDUP_WINDOW_MS = '60000';
     process.env.QWB_DIAG_MAX_BYTES = '4096';
     process.env.QWB_DIAG_RETENTION_DAYS = '3';
     process.env.QWB_PREFLIGHT_VERSION_TIMEOUT_MS = '1500';
@@ -147,10 +149,37 @@ describe('配置加载与保存', () => {
       quarantineMaxItems: 20,
       quarantineTtlMs: 3000,
       userErrorMaxChars: 200,
+      errorDedupWindowMs: 60000,
       diagnosticMaxBytes: 4096,
       diagnosticRetentionDays: 3,
       preflightVersionTimeoutMs: 1500,
     });
+  });
+
+  it('应该在去重窗口配置非法时回落到默认值', () => {
+    for (const raw of ['abc', '', '0', '-1', 'NaN', 'Infinity']) {
+      process.env.QWB_ERROR_DEDUP_WINDOW_MS = raw;
+      expect(loadConfig().errorDedupWindowMs).toBe(600_000);
+    }
+    process.env.QWB_ERROR_DEDUP_WINDOW_MS = '30000';
+    expect(loadConfig().errorDedupWindowMs).toBe(30_000);
+  });
+
+  it('应该对配置文件里的非法去重窗口同样回落默认值', () => {
+    for (const bad of [0, -1, 'abc', null, Number.NaN]) {
+      saveConfig({ ...DEFAULT_CONFIG, errorDedupWindowMs: bad as unknown as number });
+      const loaded = loadConfig();
+      expect(loaded.errorDedupWindowMs).toBe(600_000);
+      expect(typeof loaded.errorDedupWindowMs).toBe('number');
+    }
+    saveConfig({ ...DEFAULT_CONFIG, errorDedupWindowMs: 45_000 });
+    expect(loadConfig().errorDedupWindowMs).toBe(45_000);
+  });
+
+  it('应该让环境变量优先级高于配置文件', () => {
+    saveConfig({ ...DEFAULT_CONFIG, errorDedupWindowMs: 45_000 });
+    process.env.QWB_ERROR_DEDUP_WINDOW_MS = '90000';
+    expect(loadConfig().errorDedupWindowMs).toBe(90_000);
   });
 
   it('应该以 0600 权限保存配置', () => {
@@ -228,6 +257,85 @@ describe('状态归一化', () => {
     expect(state.seenMessageIds).toEqual(['ok']);
     expect(state.models).toEqual({});
     expect(state.contextTokens).toEqual({});
+  });
+
+  it('应该在缺失或非法时把最近失败记录归一为 null', () => {
+    expect(normalizeState({}).lastFailure).toBeNull();
+    expect(normalizeState({ lastFailure: 'x' }).lastFailure).toBeNull();
+    expect(normalizeState({ lastFailure: null }).lastFailure).toBeNull();
+    expect(DEFAULT_STATE.lastFailure).toBeNull();
+  });
+
+  it('应该完整保留合法的最近失败记录', () => {
+    const state = normalizeState({
+      lastFailure: {
+        kind: 'exit',
+        errorClass: 'model_quota',
+        errorCode: '110',
+        exitCode: 1,
+        at: 1_793_892_471_876,
+        taskId: 'mw3p970m-bt2wwl',
+      },
+    });
+
+    expect(state.lastFailure).toEqual({
+      kind: 'exit',
+      errorClass: 'model_quota',
+      errorCode: '110',
+      exitCode: 1,
+      at: 1_793_892_471_876,
+      taskId: 'mw3p970m-bt2wwl',
+    });
+  });
+
+  it('应该对被手改坏的最近失败记录逐字段降级', () => {
+    const state = normalizeState({
+      lastFailure: { kind: 42, errorClass: 'quota', errorCode: {}, exitCode: '1', at: 'abc' },
+    });
+
+    expect(state.lastFailure).toEqual({
+      kind: 'exit',
+      errorClass: 'unknown',
+      errorCode: undefined,
+      exitCode: null,
+      at: 0,
+      taskId: '',
+    });
+  });
+
+  it('应该把数字形态的 error_code 归一为字符串，与活路径一致', () => {
+    const state = normalizeState({ lastFailure: { errorCode: 110, at: 1, taskId: 't' } });
+    expect(state.lastFailure?.errorCode).toBe('110');
+  });
+
+  it('应该接受全部四个合法的语义类别', () => {
+    for (const errorClass of ['model_quota', 'output_limit', 'auth', 'unknown']) {
+      const state = normalizeState({ lastFailure: { errorClass, at: 1, taskId: 't' } });
+      expect(state.lastFailure?.errorClass).toBe(errorClass);
+    }
+  });
+
+  it('应该剥掉最近失败记录里的换行与控制字符，避免伪造 status 行', () => {
+    const state = normalizeState({
+      lastFailure: {
+        kind: 'exit',
+        errorClass: 'model_quota',
+        errorCode: '110\n下行额度：正常',
+        exitCode: 1,
+        at: 1,
+        taskId: 'task\u0000id\n伪造行',
+      },
+    });
+
+    expect(state.lastFailure?.errorCode).not.toMatch(/[\r\n\u0000-\u001f]/);
+    expect(state.lastFailure?.taskId).not.toMatch(/[\r\n\u0000-\u001f]/);
+    expect(state.lastFailure?.errorCode?.length).toBeLessThanOrEqual(64);
+  });
+
+  it('应该保持状态版本为 2', () => {
+    expect(
+      normalizeState({ lastFailure: { kind: 'exit', errorClass: 'auth', exitCode: 1, at: 1, taskId: 't' } }).version,
+    ).toBe(2);
   });
 });
 

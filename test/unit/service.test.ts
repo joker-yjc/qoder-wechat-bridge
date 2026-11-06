@@ -6,6 +6,7 @@ import { DEFAULT_CONFIG, DEFAULT_STATE, ensureDirs, type Config, type State } fr
 import { BridgeSendError } from '../../src/weixin/errors.js';
 import { MessageItemType, MessageType, type WeixinMessage } from '../../src/weixin/types.js';
 import { createBridgeRuntime, type ServiceDeps } from '../../src/bridge/service.js';
+import { log } from '../../src/log.js';
 
 let root = '';
 
@@ -256,13 +257,63 @@ describe('processTask 正常链路', () => {
     const { runtime, state, sent, runQoder } = makeRuntime();
     state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 1 };
     runQoder
-      .mockResolvedValueOnce({ ok: false, text: '', error: 'session not found', errorKind: 'exit', durationMs: 1 })
+      .mockResolvedValueOnce({
+        ok: false,
+        text: '',
+        error: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。',
+        errorDetail: 'session not found',
+        errorKind: 'exit',
+        durationMs: 1,
+      })
       .mockResolvedValueOnce({ ok: true, text: 'reply', sessionId: 's1', durationMs: 1 });
 
     await runtime.processTask('u', 'hello', 'ctx');
 
     expect(runQoder).toHaveBeenCalledTimes(2);
     expect(sent).toEqual(['reply']);
+  });
+
+  it('应该对续接降级日志里的内部原文脱敏', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const { runtime, state, runQoder } = makeRuntime();
+    state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 1 };
+    runQoder
+      .mockResolvedValueOnce({
+        ok: false,
+        text: '',
+        errorDetail: 'session resume not found for Authorization: Bearer abcdefghijklmnop',
+        errorKind: 'exit',
+        exitCode: 1,
+        durationMs: 1,
+      })
+      .mockResolvedValueOnce({ ok: true, text: 'reply', sessionId: 's1', durationMs: 1 });
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    const call = warn.mock.calls.find(([message]) => message === '续接会话失败，改为新建会话重试');
+    expect(call).toBeTruthy();
+    expect(String(call?.[1]?.errorDetail)).not.toContain('abcdefghijklmnop');
+    expect(String(call?.[1]?.errorDetail)).toContain('[REDACTED]');
+    warn.mockRestore();
+  });
+
+  it('应该在续接重试成功后不记录最近失败', async () => {    const { runtime, state, runQoder } = makeRuntime();
+    state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 1 };
+    runQoder
+      .mockResolvedValueOnce({
+        ok: false,
+        text: '',
+        errorDetail: 'resume not found',
+        errorClass: 'unknown',
+        errorKind: 'exit',
+        exitCode: 1,
+        durationMs: 1,
+      })
+      .mockResolvedValueOnce({ ok: true, text: 'reply', sessionId: 's1', durationMs: 1 });
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(state.lastFailure).toBeNull();
   });
 
   it('应该在 /stop 后暂停任务并回复确认', async () => {
@@ -280,6 +331,304 @@ describe('processTask 正常链路', () => {
     await task;
 
     expect(sent).toContain('任务已停止。');
+  });
+});
+
+describe('错误提示语义与去重', () => {
+  /**
+   * 构造一次语义失败结果
+   * @param overrides - 覆盖字段
+   * @returns runQoder 的返回值
+   */
+  function semanticFailure(overrides: Record<string, unknown> = {}) {
+    return {
+      ok: false,
+      text: '',
+      errorKind: 'exit' as const,
+      errorClass: 'model_quota' as const,
+      errorCode: '110',
+      error: '模型额度已用尽：今日调用次数达到上限。可稍后重试，或发 /model 切换模型。（退出码 1）',
+      errorDetail: "You've reached your daily usage limit for Chat.",
+      exitCode: 1,
+      durationMs: 1,
+      ...overrides,
+    };
+  }
+
+  it('应该下发语义中文提示并记录最近失败', async () => {
+    const { runtime, state, sent, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent).toEqual([
+      '模型额度已用尽：今日调用次数达到上限。可稍后重试，或发 /model 切换模型。（退出码 1）',
+    ]);
+    expect(state.lastFailure).toMatchObject({
+      kind: 'exit',
+      errorClass: 'model_quota',
+      errorCode: '110',
+      exitCode: 1,
+    });
+    expect(state.lastFailure?.taskId).toBeTruthy();
+  });
+
+  it('应该在窗口内对同类错误只发一条完整提示其余发 ack', async () => {
+    const { runtime, state, sent, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+
+    for (let index = 0; index < 5; index += 1) {
+      await runtime.processTask('u', `hello-${index}`, 'ctx');
+    }
+
+    expect(sent).toHaveLength(5);
+    expect(sent[0]).toContain('模型额度已用尽：今日调用次数达到上限');
+    for (const ack of sent.slice(1)) {
+      expect(ack).toMatch(/^（模型额度已用尽同 \d{2}:\d{2} 那条，本次为第 \d+ 次，已略）$/);
+      expect(ack.length).toBeLessThanOrEqual(60);
+    }
+    expect(sent[1]).toContain('第 1 次');
+    expect(sent[4]).toContain('第 4 次');
+    expect(state.outbox).toHaveLength(0);
+    expect(state.quarantine).toHaveLength(0);
+  });
+
+  it('应该让不同类别互不抑制', async () => {
+    const { runtime, sent, runQoder } = makeRuntime();
+    runQoder
+      .mockResolvedValueOnce(semanticFailure())
+      .mockResolvedValueOnce(
+        semanticFailure({
+          errorClass: 'output_limit',
+          errorCode: 'max_output_tokens',
+          error: '回答被截断：模型输出达到上限，本次没有完整结果。可发 /model 换输出上限更大的模型，或把任务拆小。（退出码 1）',
+        }),
+      );
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent[0]).toContain('模型额度已用尽');
+    expect(sent[1]).toContain('回答被截断');
+  });
+
+  it('应该在窗口过期后重新发完整提示并把计数归零', async () => {
+    let clock = 1_000_000;
+    const { runtime, sent, runQoder } = makeRuntime({}, { now: () => clock });
+    runQoder.mockResolvedValue(semanticFailure());
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    clock += 60_000;
+    await runtime.processTask('u', 'hello', 'ctx');
+    clock += 600_000;
+    await runtime.processTask('u', 'hello', 'ctx');
+    clock += 60_000;
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent[0]).toContain('模型额度已用尽：今日');
+    expect(sent[1]).toContain('第 1 次');
+    expect(sent[2]).toContain('模型额度已用尽：今日');
+    expect(sent[3]).toContain('第 1 次');
+  });
+
+  it('应该在错误提示发送失败时不入队且不推进去重窗口', async () => {
+    const { runtime, state, sent, sendText, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+    sendText.mockRejectedValueOnce(new BridgeSendError('下行额度受限', 'quota', { ret: -2 }));
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(state.outbox).toHaveLength(0);
+    expect(state.quarantine).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('模型额度已用尽：今日');
+  });
+
+  it('应该对未识别的语义错误写告警日志', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const { runtime, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(
+      semanticFailure({
+        errorClass: 'unknown',
+        errorCode: 'rate_limit',
+        error: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。',
+        errorDetail: 'Rate limit exceeded, please slow down.',
+      }),
+    );
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    const call = warn.mock.calls.find(([message]) => message === '未识别的 qodercli 语义错误');
+    expect(call?.[1]).toMatchObject({ errorCode: 'rate_limit', taskId: expect.any(String) });
+    expect(String(call?.[1]?.errorSummary)).toContain('Rate limit exceeded');
+    warn.mockRestore();
+  });
+
+  it('应该对未识别的语义错误脱敏后再写日志', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const { runtime, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(
+      semanticFailure({
+        errorClass: 'unknown',
+        errorCode: 'server_error',
+        errorDetail: 'Authorization: Bearer abcdefghijklmnop failed',
+      }),
+    );
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    const call = warn.mock.calls.find(([message]) => message === '未识别的 qodercli 语义错误');
+    expect(call).toBeTruthy();
+    expect(String(call?.[1]?.errorSummary)).toContain('[REDACTED]');
+    expect(String(call?.[1]?.errorSummary)).not.toContain('abcdefghijklmnop');
+    warn.mockRestore();
+  });
+
+  it('应该在错误被抑制时写抑制日志', async () => {
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    const { runtime, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    const call = info.mock.calls.find(([message]) => message === '错误提示被去重窗口抑制');
+    expect(call?.[1]).toMatchObject({ category: 'suppressed', errorClass: 'model_quota', suppressed: 1 });
+    info.mockRestore();
+  });
+
+  it('应该让 unknown 类不参与去重，每次都发完整提示', async () => {
+    const { runtime, sent, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(
+      semanticFailure({
+        errorClass: 'unknown',
+        errorCode: undefined,
+        error: '执行失败：任务超过 600 秒被终止。详见本机日志。',
+        errorDetail: undefined,
+        errorKind: 'timeout',
+      }),
+    );
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toBe('执行失败：任务超过 600 秒被终止。详见本机日志。');
+    expect(sent[1]).toBe('执行失败：任务超过 600 秒被终止。详见本机日志。');
+  });
+
+  it('应该让同属 unknown 的不同根因互不抑制', async () => {
+    const { runtime, sent, runQoder } = makeRuntime();
+    runQoder
+      .mockResolvedValueOnce(
+        semanticFailure({
+          errorClass: 'unknown',
+          errorCode: undefined,
+          error: '执行失败：无法启动 qodercli。请检查 QWB_QODER_BIN，详见本机日志。',
+          errorDetail: undefined,
+          errorKind: 'spawn',
+        }),
+      )
+      .mockResolvedValueOnce(
+        semanticFailure({
+          errorClass: 'unknown',
+          errorCode: 'rate_limit',
+          error: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。',
+          errorDetail: 'Rate limit exceeded',
+        }),
+      );
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent[0]).toContain('无法启动 qodercli');
+    expect(sent[1]).toBe('执行失败：qodercli 异常退出（退出码 1）。详见本机日志。');
+  });
+
+  it('应该在 unknown 被抑制时不写抑制日志', async () => {
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    const { runtime, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure({ errorClass: 'unknown', errorCode: 'rate_limit' }));
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(info.mock.calls.filter(([message]) => message === '错误提示被去重窗口抑制')).toHaveLength(0);
+    info.mockRestore();
+  });
+
+  it('应该在错误提示未送达时写出告警内容', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const { runtime, sendText, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+    sendText.mockRejectedValueOnce(new BridgeSendError('下行额度受限', 'quota', { ret: -2 }));
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    const call = warn.mock.calls.find(([message]) => message === '错误提示未送达，不推进去重窗口');
+    expect(call?.[1]).toMatchObject({ userId: 'u', errorClass: 'model_quota', outcome: 'skipped', suppressed: 0 });
+    expect(call?.[1]?.taskId).toBeTruthy();
+    warn.mockRestore();
+  });
+
+  it('应该在会话过期导致 ack 未送达时不入队', async () => {
+    const { runtime, state, sent, sendText, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    expect(sent).toHaveLength(1);
+
+    sendText.mockRejectedValueOnce(new BridgeSendError('微信会话过期', 'session_expired', { ret: -14 }));
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent).toHaveLength(1);
+    expect(state.outbox).toHaveLength(0);
+    expect(state.quarantine).toHaveLength(0);
+  });
+
+  it('应该在 ack 未送达时不推进抑制计数', async () => {
+    const { runtime, sent, sendText, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure());
+
+    await runtime.processTask('u', 'hello', 'ctx');
+    sendText.mockRejectedValueOnce(new BridgeSendError('下行额度受限', 'quota', { ret: -2 }));
+    await runtime.processTask('u', 'hello', 'ctx');
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toContain('第 1 次');
+  });
+
+  it('应该在任务成功时保留上一次失败记录', async () => {
+    const { runtime, state, runQoder } = makeRuntime();
+    runQoder.mockResolvedValueOnce(semanticFailure());
+    await runtime.processTask('u', 'hello', 'ctx');
+    const recorded = state.lastFailure;
+    expect(recorded?.errorClass).toBe('model_quota');
+
+    runQoder.mockResolvedValueOnce({ ok: true, text: 'done', sessionId: 's1', durationMs: 1 });
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(state.lastFailure).toEqual(recorded);
+  });
+
+  it('应该在任务结束的日志里带上语义类别与诊断路径', async () => {
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    const { runtime, runQoder } = makeRuntime();
+    runQoder.mockResolvedValue(semanticFailure({ diagnosticPath: '/tmp/diag/1-task.log' }));
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    const call = info.mock.calls.find(([message]) => message === '任务结束');
+    expect(call?.[1]).toMatchObject({
+      ok: false,
+      errorKind: 'exit',
+      errorClass: 'model_quota',
+      errorCode: '110',
+      diagnosticPath: '/tmp/diag/1-task.log',
+    });
+    info.mockRestore();
   });
 });
 

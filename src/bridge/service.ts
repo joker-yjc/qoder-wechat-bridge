@@ -35,7 +35,8 @@ import { downloadItemMedia, pruneInbox, type SavedMedia } from '../weixin/media.
 import { runQoder } from './qoder.js';
 import { flushOutbox, pruneOutbox, pushOutbox, type DeliveryOutcome, type OutboxPolicy } from './outbox.js';
 import { OutboundSession } from './outbound.js';
-import { buildUserErrorReply } from './failure.js';
+import { buildAckText, buildUserErrorReply } from './failure.js';
+import { ErrorDedupStore } from './error-dedup.js';
 import { redactSensitive, pruneDiagnostics } from '../diagnostics.js';
 import { detectNodeChange, nodeFingerprint, runPreflight, type PreflightResult } from './preflight.js';
 import { takePending } from '../notify.js';
@@ -191,6 +192,8 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
   const downloadMediaFn = deps.downloadItemMedia ?? downloadItemMedia;
   const nodeFingerprintFn = deps.nodeFingerprint ?? nodeFingerprint;
   const now = deps.now ?? ((): number => Date.now());
+  /** 错误提示去重：内存态，重启即重置（最坏是多发一条完整提示，失败方向安全） */
+  const errorDedup = new ErrorDedupStore({ windowMs: config.errorDedupWindowMs, now });
   let nodeSnapshot = nodeFingerprintFn();
   /** 每个微信用户一条串行队列，避免同一会话并发 */
   const queues = new Map<string, Promise<void>>();
@@ -587,9 +590,14 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
         return;
       }
 
-      // 会话不可续接时降级为新会话重试一次
-      if (!result.ok && record?.sessionId && /session|resume|not found/i.test(result.error ?? '')) {
-        log.warn('续接会话失败，改为新建会话重试', { error: result.error, taskId: id });
+      // 会话不可续接时降级为新会话重试一次；匹配内部原文而非用户文案，避免中文模板让该路径静默失效
+      if (!result.ok && record?.sessionId && /session|resume|not found/i.test(result.errorDetail ?? '')) {
+        log.warn('续接会话失败，改为新建会话重试', {
+          errorDetail: redactSensitive(result.errorDetail ?? '').slice(0, 160),
+          errorClass: result.errorClass ?? '',
+          errorCode: result.errorCode ?? '',
+          taskId: id,
+        });
         result = await runQoderFn({
           prompt: text,
           cwd: config.cwd.trim() ? config.cwd : undefined,
@@ -618,31 +626,85 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
         persistState();
       }
 
+      if (!result.ok) {
+        state.lastFailure = {
+          kind: result.errorKind ?? 'exit',
+          errorClass: result.errorClass ?? 'unknown',
+          errorCode: result.errorCode,
+          exitCode: result.exitCode ?? null,
+          at: now(),
+          taskId: id,
+        };
+        persistState();
+      }
+
       log.info('任务结束', {
         userId,
         taskId: id,
         ok: result.ok,
         errorKind: result.errorKind ?? '',
+        errorClass: result.errorClass ?? '',
+        errorCode: result.errorCode ?? '',
         exitCode: result.exitCode ?? null,
         durationMs: result.durationMs,
         sessionId: result.sessionId ?? record?.sessionId ?? '',
         replyChars: result.ok ? result.text.length : 0,
         model: result.modelUsed ?? modelForTask ?? '(default)',
+        diagnosticPath: result.diagnosticPath ?? '',
       });
+
+      if (!result.ok && result.errorClass === 'unknown' && (result.errorCode || result.errorDetail)) {
+        log.warn('未识别的 qodercli 语义错误', {
+          errorCode: result.errorCode ?? '',
+          errorSummary: redactSensitive(result.errorDetail ?? '').slice(0, 160),
+          taskId: id,
+        });
+      }
 
       if (result.ok) {
         const replyText = result.text.trim() || '任务执行完成，但没有文本输出。';
         await session.sendChunked(replyText, { kind: 'reply', taskId: id });
       } else {
-        const reply =
-          result.error ??
-          buildUserErrorReply({
-            kind: result.errorKind ?? 'exit',
-            exitCode: result.exitCode,
-            detail: undefined,
-            maxChars: config.userErrorMaxChars,
+        const errorClass = result.errorClass ?? 'unknown';
+        // unknown 覆盖 timeout / spawn / empty / parse 与未收录错误码：各自的提示带不同的失败种类与退出码，
+        // 归到一个桶会互相抑制并丢掉关键信息（实测第二次超时只剩「未归类同 HH:MM 那条」），故不参与去重
+        const deduped = errorClass !== 'unknown';
+        const decision = deduped
+          ? errorDedup.plan(userId, errorClass)
+          : { full: true, firstAt: now(), suppressed: 0 };
+        const reply = decision.full
+          ? (result.error ??
+            buildUserErrorReply({
+              kind: result.errorKind ?? 'exit',
+              errorClass,
+              exitCode: result.exitCode,
+              detail: undefined,
+              maxChars: config.userErrorMaxChars,
+            }))
+          : buildAckText({ errorClass, firstAt: decision.firstAt, suppressed: decision.suppressed });
+        // 错误提示与 ack 一律不入补发队列：发送失败只写日志，避免重新堵塞队列
+        const outcome = await session.sendSingle(reply, { kind: 'error', queueOnFailure: false, taskId: id });
+        if (outcome === 'sent') {
+          if (deduped) errorDedup.commit(userId, errorClass, decision.full);
+        } else {
+          log.warn('错误提示未送达，不推进去重窗口', {
+            userId,
+            taskId: id,
+            errorClass,
+            outcome,
+            suppressed: decision.suppressed,
           });
-        await session.sendSingle(reply, { kind: 'error', queueOnFailure: true, taskId: id });
+        }
+        if (!decision.full) {
+          log.info('错误提示被去重窗口抑制', {
+            category: 'suppressed',
+            userId,
+            taskId: id,
+            errorClass,
+            suppressed: decision.suppressed,
+            firstAt: decision.firstAt,
+          });
+        }
       }
     } finally {
       runningTasks.delete(userId);

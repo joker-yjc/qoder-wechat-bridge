@@ -2,12 +2,16 @@
  * qodercli 失败提示：把失败类别转换为单条、可操作、限长的用户提示
  * @module bridge/failure
  */
+import { ERROR_CLASS_LABEL, type QoderErrorClass } from './error-class.js';
 
 /** qodercli 失败类别 */
 export type QoderErrorKind = 'timeout' | 'spawn' | 'empty' | 'parse' | 'exit' | 'is_error';
 
 /** 截断提示 */
 const LOG_SUFFIX = '…详见本机日志。';
+
+/** ack 字符上限：实测最长 ack 为 34 字符，故只做常量约束不做运行时截断 */
+export const ACK_MAX_CHARS = 60;
 
 /**
  * 按字符上限截断文本，不切断字素簇
@@ -57,11 +61,13 @@ function firstLine(detail: string | undefined, maxChars: number): string {
 
 /**
  * 生成单条用户可读错误提示
- * @param input - 失败类别、退出码、可选错误文本
+ * @param input - 失败类别、语义类别、退出码、可选错误文本
  * @returns 不超过 maxChars 的单条提示
  */
 export function buildUserErrorReply(input: {
   kind: QoderErrorKind;
+  /** 业务语义类别；命中已知类别时改用固定中文模板 */
+  errorClass?: QoderErrorClass;
   exitCode?: number | null;
   detail?: string;
   timeoutMs?: number;
@@ -69,6 +75,19 @@ export function buildUserErrorReply(input: {
 }): string {
   const code = input.exitCode === undefined || input.exitCode === null ? '未知' : String(input.exitCode);
   let text: string;
+
+  // 语义分支不引用 input.detail，从结构上保证英文原文不会成为回复正文
+  switch (input.errorClass) {
+    case 'model_quota':
+      return fit(`模型额度已用尽：今日调用次数达到上限。可稍后重试，或发 /model 切换模型。（退出码 ${code}）`, input.maxChars);
+    case 'output_limit':
+      return fit(
+        `回答被截断：模型输出达到上限，本次没有完整结果。可发 /model 换输出上限更大的模型，或把任务拆小。（退出码 ${code}）`,
+        input.maxChars,
+      );
+    case 'auth':
+      return fit(`Qoder 凭据已失效：需在本机重新登录 qodercli 后重试。（退出码 ${code}）`, input.maxChars);
+  }
 
   switch (input.kind) {
     case 'timeout':
@@ -100,4 +119,19 @@ export function buildUserErrorReply(input: {
   }
 
   return fit(text, input.maxChars);
+}
+
+/**
+ * 生成去重窗口内的极简 ack
+ *
+ * 长度上界为 34 字符（label ≤7 + HH:mm 5 + 固定文案 16 + 次数 ≤4 + 括号 2），恒小于 ACK_MAX_CHARS，
+ * 故不做运行时截断，改由单测穷举四个类别与各种次数断言长度
+ * @param input - 语义类别、窗口内首次提示时间与含本次的累计抑制次数
+ * @returns 不超过 ACK_MAX_CHARS 的单行提示
+ */
+export function buildAckText(input: { errorClass: QoderErrorClass; firstAt: number; suppressed: number }): string {
+  // 用 toTimeString 而非 toLocaleTimeString：后者输出含秒且受 ICU locale 影响，前者格式固定为 HH:MM:SS GMT+xxxx
+  const hourMinute = new Date(input.firstAt).toTimeString().slice(0, 5);
+  const label = ERROR_CLASS_LABEL[input.errorClass];
+  return `（${label}同 ${hourMinute} 那条，本次为第 ${input.suppressed} 次，已略）`;
 }

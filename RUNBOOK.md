@@ -91,7 +91,9 @@ node dist/cli.js run --permission-mode dont_ask
 | `SyntaxError: Invalid regular expression flags` | node 仍是 v16 | `n 22` |
 | 扫码后 `binded_redirect` | 该微信号已绑过其它 OpenClaw 形态机器人 | 先解绑，或换号 |
 | 收消息正常但回复失败 `ret=-2` | 下行额度耗尽 / context_token 失效 | 消息保留在 outbox，下一次入站优先补发；不计数、不隔离。连续出现时看 `status` 的额度告警 |
-| qodercli 异常退出 / 输出无法解析 | 子进程崩溃、输出不是 JSON | 只回一条短错误；诊断在 `logs/diagnostics/`，单文件 ≤64KB |
+| qodercli 异常退出 / 输出无法解析 | 子进程崩溃、输出不是 JSON、或语义错误码未收录 | 只回一条短错误；诊断在 `logs/diagnostics/`，单文件 ≤64KB，头部含 `errorClass` / `errorCode`。语义分类见 5.1 |
+| 反复收到同一类错误 | `model_quota` / `output_limit` / `auth` 在去重窗口内只发一条完整提示，其余发短回执；`unknown` 不去重 | 属预期行为；被抑制次数看日志 `category=suppressed`。窗口用 `QWB_ERROR_DEDUP_WINDOW_MS` 调整 |
+| 错误提示一条都没收到 | 下行额度耗尽 / 会话过期时错误提示被丢弃（不入队，只写日志） | 看日志 `错误提示未送达，不推进去重窗口`；正常回复仍在 outbox 等下个窗口补发 |
 | 隔离区有消息 | 某条消息连续永久失败，已停止自动补发 | `status` 查看数量；手动恢复需停服编辑 `state.json` 的 `quarantine`，或等 7 天过期 |
 | outbox 超限 / 过期 | 补发队列达到 200 条或 24 小时 | 查看日志中的 `outbox 超限` / `消息已过期`，旧消息会被丢弃 |
 | `stop` 退出码 2 | launchd 托管，未真正停止 | 执行它打印的 `launchctl bootout gui/<uid>/<label>` |
@@ -101,6 +103,28 @@ node dist/cli.js run --permission-mode dont_ask
 | 日志 `-14` | 微信会话过期 | 重新 `login`；不要高频重登（会触发风控） |
 | `npm error EACCES ~/.npm/_cacache` | 缓存目录有 root 所有的文件 | 用 `--cache ./.npm-cache`，或自行修复缓存权限 |
 | `install-scripts` 拦截 esbuild | npm 11 默认禁止 postinstall | 本项目不依赖 tsx/esbuild，用 `tsc` 构建即可 |
+
+### 5.1 错误类别速查
+
+桥接把 qodercli 的失败分成**传输层类别**（`errorKind`，进程怎么失败的）与**业务语义类别**（`errorClass`，qodercli 报的是什么），两者正交，都记在日志与诊断文件头里。
+
+| `errorClass` | 识别特征（实测） | 用户看到 | 处置 |
+|---|---|---|---|
+| `model_quota` | `error_code=110`（数字）或 `error_message` 含 `Billing daily count exceeded` | `模型额度已用尽：…` | 稍后重试或 `/model` 换模型。实测 110 不是硬性全天封锁：2026-11-05 曾出现 23:21 失败、23:22 同模型成功 |
+| `output_limit` | `error_code="max_output_tokens"`，或 `stop_reason="max_tokens"` 且 `is_error=true` | `回答被截断：…` | `/model` 换输出上限更大的模型，或把任务拆小。BYOK 模型的思考 token 与正文共用额度时容易触发 |
+| `auth` | `error_code="authentication_failed"` | `Qoder 凭据已失效：…` | 本机执行 `qodercli login`；微信侧无入口 |
+| `unknown` | 以上都未命中 | 一期传输层文案（如 `执行失败：qodercli 异常退出（退出码 1）。详见本机日志。`）。**不参与去重**，每次都发完整提示 | 看日志 `未识别的 qodercli 语义错误` 里的 `errorCode` 与摘要，攒够样本再补规则 |
+
+传输层类别 `errorKind` 保持一期不变：`timeout` / `spawn` / `empty` / `parse` / `exit` / `is_error`。这四类里没有语义字段，`errorClass` 恒为 `unknown`，文案与 0.2.0 逐字一致。
+
+**两种"额度"不要混：**
+
+| 名称 | 含义 | 在哪看 |
+|---|---|---|
+| `model_quota`（模型额度） | qodercli 侧模型调用额度耗尽，`error_code=110` | `status` 的「最近失败」行、日志 `errorClass` |
+| `quota`（下行额度） | 微信侧 `ret=-2`，一次入站约 10 条下行的额度 | `status` 的「下行额度」行、日志 `category=quota` |
+
+两者毫无关系，代码与文案里也刻意不共用名字。qodercli 上游枚举里还有 `billing_error` / `rate_limit` / `invalid_request` / `server_error`，目前**零实测样本**，一律落 `unknown` 并写告警日志，不做猜测性归类。
 
 ## 6. 观察与验收
 
@@ -126,6 +150,16 @@ tail -f ~/.local/state/qoder-wechat-bridge/logs/bridge-$(date +%F).jsonl
 - outbox：606 字回复只发 1 段，10 条入队；重启后仍为 10 条；下一轮先补 9 条，剩 2 条；再发一条后归零；
 - stop：launchd 下打印 bootout 并返回 2；手动实例 603ms / 604ms 退出并返回 0；
 - 验收中发现并修复：`stop` 曾把包含 `node dist/cli.js run` 的 shell 包装命令误当成第二实例；已改为按 argv 首段匹配并加回归用例。
+
+验收标准（0.3.0）——自动化部分已通过（304 tests，Lines 97.77%），**真机部分待执行，结果未填**：
+
+1. 用 `/model` 切到输出上限较小的 BYOK 模型，发一个长任务复现截断：应收到「回答被截断：…」而不是「异常退出（退出码 1）」；
+2. 额度耗尽时段连发 3 条消息：第 1 条收到完整提示，第 2、3 条收到 `（…同 HH:MM 那条，本次为第 N 次，已略）` 且 N 递增；
+3. `qoder-wechat status` 的「最近失败」行显示类别、`error_code`、时间、任务 id，且与「下行额度」行分成两行、字面可区分；
+4. 当日诊断文件头部含 `# errorClass:` 与 `# errorCode:` 两行，`## stdout` / `## stderr` 未被挤掉；
+5. 重启服务后再触发一次同类失败：应重新收到完整提示（去重窗口在内存，重启即重置，属预期）；
+6. 上述全过程 `status` 的待补发与隔离区计数始终为 0（错误提示不入队）；
+7. 一期 7 条验收标准全部回归通过。
 
 ## 7. 安全
 

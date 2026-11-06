@@ -17,6 +17,8 @@ export default defineConfig({
         'src/notify.ts',
         'src/bridge/outbox.ts',
         'src/bridge/outbound.ts',
+        'src/bridge/error-class.ts',
+        'src/bridge/error-dedup.ts',
         'src/bridge/failure.ts',
         'src/bridge/qoder.ts',
         'src/bridge/preflight.ts',

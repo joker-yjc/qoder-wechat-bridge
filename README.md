@@ -4,7 +4,7 @@
 
 适合"人不在电脑前，但想让电脑上的 Qoder 继续干活"的场景。
 
-> 当前版本 `0.1.1`：单聊文本、主动提醒、双向图片/文件/视频、语音接收（平台转写）与语音发送（macOS 原型）。
+> 当前版本 `0.3.0`：单聊文本、主动提醒、双向图片/文件/视频、语音接收（平台转写）与语音发送（macOS 原型）。`0.2` 起加入出站故障隔离与补发队列，`0.3` 起失败提示按语义归类、给出可执行建议并对同类错误去重。
 
 ---
 
@@ -222,7 +222,20 @@ qoder-wechat status                                              # 登录状态
 
 **任务跑了但微信没收到？** 官方通道有额度限制：一次入站大约只能回 10 条消息，`context_token` 约 24 小时过期。`ret=-2` 现在按“额度耗尽”处理：消息保留在 outbox，下一次入站优先补发，不会计入失败次数，也不会被隔离。补发队列默认上限 200 条 / 24 小时，超限时丢弃最旧消息并写日志；连续多个窗口出现 `ret=-2` 时，`status` 会显示告警。
 
-**qodercli 崩了会收到什么？** 只会收到一条 ≤300 字的短提示，包含失败类别和退出码；完整的 stdout / stderr 写到 `~/.local/state/qoder-wechat-bridge/logs/diagnostics/YYYY-MM-DD/`（单文件 ≤64KB，保留 7 天），不会把源码或几百 KB 文本发到微信。
+**qodercli 崩了会收到什么？** 只会收到一条 ≤300 字的短提示。能识别出语义的失败会直接说人话并给出下一步动作：
+
+| 你会看到 | 含义 | 建议动作 |
+|---|---|---|
+| `模型额度已用尽：…` | qodercli 报 `error_code=110`（当日调用次数到上限） | 稍后重试，或发 `/model` 换个模型 |
+| `回答被截断：…` | 模型输出达到上限，本轮没有完整结果 | 发 `/model` 换输出上限更大的模型，或把任务拆小 |
+| `Qoder 凭据已失效：…` | qodercli 登录态失效 | 在**本机**执行 `qodercli login`（微信侧没有入口） |
+| `执行失败：…（退出码 N）` | 传输层失败或未收录的错误码 | 看本机日志与诊断文件 |
+
+完整的 stdout / stderr 写到 `~/.local/state/qoder-wechat-bridge/logs/diagnostics/YYYY-MM-DD/`（单文件 ≤64KB，保留 7 天，含 `errorClass` / `errorCode` 两行便于排查），不会把源码或几百 KB 文本发到微信。
+
+**同一类错误连着失败会刷屏吗？** 不会。上表前三类（模型额度 / 截断 / 凭据）在同一会话内 10 分钟窗口里只发一条完整提示，后续改发一条 ≤60 字的回执，例如 `（模型额度已用尽同 23:13 那条，本次为第 4 次，已略）`，让你知道消息没被无视、也不必再试。窗口时长可用 `QWB_ERROR_DEDUP_WINDOW_MS` 调整；服务重启后窗口重置（最坏是多发一条完整提示）。
+
+第四类（传输层失败与未收录错误码）**不去重**，每次都发完整提示——因为它们的提示各带不同的失败种类与退出码，合并成"未归类"回执会丢掉关键信息。**错误提示不进补发队列**：发送失败只写日志，不会把 outbox 塞满。
 
 **结果太长会怎样？** 仍按每条 2000 字切分，最多发 9 条；剩下的进补发队列（默认 200 条 / 24 小时）。如果某条消息连续 3 次永久失败，会移入隔离区，后面的正常消息继续送达；隔离区默认保留 7 天。
 
@@ -311,6 +324,7 @@ qoder-wechat notify "构建完成，有 3 个测试失败，需要你确认是�
 | `quarantineMaxItems` | `QWB_QUARANTINE_MAX` | `500` | 隔离区最大条数 |
 | `quarantineTtlMs` | `QWB_QUARANTINE_TTL_MS` | `604800000` | 隔离区保留时长（7 天） |
 | `userErrorMaxChars` | `QWB_USER_ERROR_CHARS` | `300` | 单条错误提示最大字符数 |
+| `errorDedupWindowMs` | `QWB_ERROR_DEDUP_WINDOW_MS` | `600000` | 同类错误提示的去重窗口（10 分钟）；窗口内只发一条完整提示，其余发短回执 |
 | `diagnosticMaxBytes` | `QWB_DIAG_MAX_BYTES` | `65536` | 单次失败诊断文件上限 |
 | `diagnosticRetentionDays` | `QWB_DIAG_RETENTION_DAYS` | `7` | 诊断文件保留天数 |
 | `preflightVersionTimeoutMs` | `QWB_PREFLIGHT_VERSION_TIMEOUT_MS` | `5000` | `qodercli --version` 预检超时 |
@@ -368,6 +382,8 @@ console.log(result.ok, result.text);
 - 出站分片仍按 **2000 字符**，本期没有引入 UTF-8 字节上限；超长中文仍可能受通道实际限制影响。
 - outbox 默认 **200 条 / 24 小时**；隔离区默认 **500 条 / 7 天**。超限或过期会丢最旧消息并写日志。
 - qodercli 失败的完整诊断只在本机 `logs/diagnostics/`，不会发到微信；单文件 ≤64KB，保留 7 天。
+- 错误提示与去重回执**不进补发队列**：发送失败只写日志。去重窗口存在内存里，服务重启即重置（最坏是多发一条完整提示）。
+- 语义归类只认三个已实测的 `error_code`（`110` / `max_output_tokens` / `authentication_failed`）；其它错误码仍落到"退出码 N"这类通用提示，同时写日志等待补充规则。
 - `stop` 在 launchd 托管下返回 **2**，表示服务仍在运行，需要手动执行它打印的 `launchctl bootout`。
 - Windows 可用：收发、附件、通知等与 macOS 一致；登录二维码需手动打开 `~/.local/state/qoder-wechat-bridge/wechat-qr.png`。
 - 出站语音为实验性：协议字段已对齐，但微信客户端不渲染；发音频请用 `send-file`。
@@ -376,10 +392,11 @@ console.log(result.ok, result.text);
 
 ## Roadmap
 
-- `0.2`：出站故障隔离、错误限长、outbox 上限/TTL、stop 加固、启动预检（当前版本）。
-- `0.3`：双向决策（`ask`：发问题后等待微信回复再继续）、开机自启（LaunchAgent / systemd）
-- `0.4`：图片与文件、进度提示、多会话与按项目路由
-- `0.5`：`init` / `init --rebind` / `logout` 等账号管理命令
+- `0.2`：出站故障隔离、错误限长、outbox 上限/TTL、stop 加固、启动预检。
+- `0.3`：失败按语义归类（模型额度 / 输出截断 / 凭据失效）、可读提示与动作建议、同类错误去重与回执、`status` 显示最近失败（当前版本）。
+- `0.4`：双向决策（`ask`：发问题后等待微信回复再继续）、开机自启（LaunchAgent / systemd）
+- `0.5`：图片与文件、进度提示、多会话与按项目路由
+- `0.6`：`init` / `init --rebind` / `logout` 等账号管理命令
 
 ## License
 

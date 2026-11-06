@@ -58,6 +58,56 @@ describe('writeDiagnostic', () => {
     if (process.platform !== 'win32') expect(fs.statSync(result.path).mode & 0o777).toBe(0o600);
   });
 
+  it('应该在 header 里紧随 kind 记录语义类别与 error_code', () => {
+    const result = writeDiagnostic(
+      {
+        taskId: 'semantic',
+        kind: 'exit',
+        errorClass: 'model_quota',
+        errorCode: '110',
+        exitCode: 1,
+        stdout: 'body',
+        stderr: '',
+      },
+      { dir: root },
+    );
+
+    const lines = fs.readFileSync(result.path, 'utf-8').split('\n');
+    expect(lines).toContain('# errorClass: model_quota');
+    expect(lines).toContain('# errorCode: 110');
+    expect(lines.indexOf('# errorClass: model_quota')).toBe(lines.indexOf('# kind: exit') + 1);
+    expect(lines.indexOf('# errorCode: 110')).toBe(lines.indexOf('# errorClass: model_quota') + 1);
+  });
+
+  it('应该在语义字段缺失时写出空值行而不出现 undefined', () => {
+    const result = writeDiagnostic({ taskId: 'plain', kind: 'timeout', stdout: '', stderr: 'boom' }, { dir: root });
+
+    const content = fs.readFileSync(result.path, 'utf-8');
+    expect(content).toContain('# errorClass: \n');
+    expect(content).toContain('# errorCode: \n');
+    expect(content).not.toContain('undefined');
+  });
+
+  it('应该在 header 变长后仍把总字节数控制在预算内', () => {
+    const maxBytes = 512;
+    const result = writeDiagnostic(
+      {
+        taskId: 'budget',
+        kind: 'exit',
+        errorClass: 'output_limit',
+        errorCode: 'max_output_tokens',
+        stdout: 'a'.repeat(100_000),
+        stderr: 'b'.repeat(100_000),
+      },
+      { dir: root, maxBytes },
+    );
+
+    expect(result.bytes).toBeLessThanOrEqual(maxBytes);
+    const content = fs.readFileSync(result.path, 'utf-8');
+    expect(content).toContain('# errorClass: output_limit');
+    expect(content).toContain('# errorCode: max_output_tokens');
+  });
+
   it('应该把 stdout 与 stderr 限制在总字节预算内', () => {
     const maxBytes = 1024;
     const result = writeDiagnostic(

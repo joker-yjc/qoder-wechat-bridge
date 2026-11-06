@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ERROR_CODE_MAX_CHARS, sanitizeSingleLine, type QoderErrorClass } from './bridge/error-class.js';
 
 /** 包名，用于目录名 */
 const APP = 'qoder-wechat-bridge';
@@ -147,6 +148,8 @@ export interface Config {
   quarantineTtlMs: number;
   /** 单条用户错误提示最大字符数 */
   userErrorMaxChars: number;
+  /** 同类错误提示的去重窗口时长 */
+  errorDedupWindowMs: number;
   /** 单次失败诊断文件最大字节数 */
   diagnosticMaxBytes: number;
   /** 诊断文件保留天数 */
@@ -183,6 +186,7 @@ export const DEFAULT_CONFIG: Config = {
   quarantineMaxItems: 500,
   quarantineTtlMs: 7 * 24 * 60 * 60_000,
   userErrorMaxChars: 300,
+  errorDedupWindowMs: 10 * 60_000,
   diagnosticMaxBytes: 64 * 1024,
   diagnosticRetentionDays: 7,
   preflightVersionTimeoutMs: 5_000,
@@ -214,6 +218,15 @@ const ENV_OVERRIDES: ReadonlyArray<[keyof Config, string, (raw: string) => unkno
   ['quarantineMaxItems', 'QWB_QUARANTINE_MAX', (v) => Number(v)],
   ['quarantineTtlMs', 'QWB_QUARANTINE_TTL_MS', (v) => Number(v)],
   ['userErrorMaxChars', 'QWB_USER_ERROR_CHARS', (v) => Number(v)],
+  [
+    'errorDedupWindowMs',
+    'QWB_ERROR_DEDUP_WINDOW_MS',
+    // 非法值必须回落默认：NaN 会让窗口永不过期，用户首次失败后永久只收到 ack
+    (v) => {
+      const parsed = Number(v);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CONFIG.errorDedupWindowMs;
+    },
+  ],
   ['diagnosticMaxBytes', 'QWB_DIAG_MAX_BYTES', (v) => Number(v)],
   ['diagnosticRetentionDays', 'QWB_DIAG_RETENTION_DAYS', (v) => Number(v)],
   ['preflightVersionTimeoutMs', 'QWB_PREFLIGHT_VERSION_TIMEOUT_MS', (v) => Number(v)],
@@ -266,6 +279,22 @@ export interface QuotaState {
   lastAt: number;
 }
 
+/** 最近一次任务失败记录，供 status 展示 */
+export interface LastFailureRecord {
+  /** 传输层类别，取自 QoderErrorKind */
+  kind: string;
+  /** 业务语义类别 */
+  errorClass: QoderErrorClass;
+  /** 归一化后的 error_code */
+  errorCode?: string;
+  /** 退出码；null 表示未知（超时 / 无法启动） */
+  exitCode: number | null;
+  /** 发生时间（毫秒时间戳） */
+  at: number;
+  /** 关联任务 id */
+  taskId: string;
+}
+
 /** 持久化运行状态 */
 export interface State {
   /** 状态版本 */
@@ -284,6 +313,8 @@ export interface State {
   models: Record<string, string>;
   /** 微信用户 -> 最近一次入站消息的 context_token，供主动提醒使用 */
   contextTokens: Record<string, string>;
+  /** 最近一次任务失败；从未失败时为 null */
+  lastFailure: LastFailureRecord | null;
 }
 
 /** 状态默认值 */
@@ -297,6 +328,7 @@ export const DEFAULT_STATE: State = {
   seenMessageIds: [],
   models: {},
   contextTokens: {},
+  lastFailure: null,
 };
 
 /**
@@ -332,6 +364,11 @@ export function loadConfig(): Config {
     // 首次运行没有配置文件
   }
   const merged: Config = { ...DEFAULT_CONFIG, ...fromFile };
+  // errorDedupWindowMs 必须校验：NaN 会让去重窗口永不过期，用户首次失败后永久只收到 ack，
+  // 是唯一一条把失败方向反转的配置路径。配置文件可能是手写的，值甚至不是 number
+  const dedupWindow = Number(merged.errorDedupWindowMs);
+  merged.errorDedupWindowMs =
+    Number.isFinite(dedupWindow) && dedupWindow > 0 ? dedupWindow : DEFAULT_CONFIG.errorDedupWindowMs;
   for (const [key, envName, parse] of ENV_OVERRIDES) {
     const raw = process.env[envName];
     if (raw === undefined || raw === '') continue;
@@ -407,6 +444,31 @@ function normalizeQuarantineItem(raw: Record<string, unknown>): QuarantineItem {
   };
 }
 
+/** 合法的语义类别取值，用于拦截被手改坏的 state.json */
+const ERROR_CLASSES: readonly QoderErrorClass[] = ['model_quota', 'output_limit', 'auth', 'unknown'];
+
+/** 任务 id 长度上限；实际由 makeTaskId 生成，约 13 字符 */
+const TASK_ID_MAX_CHARS = 64;
+
+/**
+ * 把任意值归一化为最近失败记录
+ * @param raw - 原始值
+ * @returns 归一化后的记录；不可用时为 null
+ */
+function normalizeLastFailure(raw: unknown): LastFailureRecord | null {
+  if (!isRecord(raw)) return null;
+  return {
+    kind: typeof raw.kind === 'string' ? raw.kind : 'exit',
+    errorClass: ERROR_CLASSES.find((value) => value === raw.errorClass) ?? 'unknown',
+    // errorCode / taskId 会拼进 status 的纯文本行，与活路径共用同一套清洗（审查 N-1）；
+    // kind 不参与渲染，故不清洗
+    errorCode: sanitizeSingleLine(raw.errorCode, ERROR_CODE_MAX_CHARS),
+    exitCode: typeof raw.exitCode === 'number' ? raw.exitCode : null,
+    at: asNumber(raw.at, 0),
+    taskId: sanitizeSingleLine(raw.taskId, TASK_ID_MAX_CHARS) ?? '',
+  };
+}
+
 /**
  * 把任意状态归一化为 v2
  * @param raw - 原始状态
@@ -434,6 +496,7 @@ export function normalizeState(raw: Record<string, unknown>): State {
       : [],
     models: isRecord(raw.models) ? (raw.models as Record<string, string>) : {},
     contextTokens: isRecord(raw.contextTokens) ? (raw.contextTokens as Record<string, string>) : {},
+    lastFailure: normalizeLastFailure(raw.lastFailure),
   };
 }
 

@@ -23,6 +23,7 @@ export {
 } from './config.js';
 export type {
   Config,
+  LastFailureRecord,
   OutboxItem,
   OutboxItemKind,
   QuarantineItem,
@@ -67,8 +68,12 @@ export { cleanEnv, runQoder } from './bridge/qoder.js';
 export type { QoderRunInput, QoderRunResult } from './bridge/qoder.js';
 export { flushOutbox, pruneOutbox, pushOutbox, quarantineItem } from './bridge/outbox.js';
 export type { DeliveryOutcome, FlushResult, OutboxPolicy, PruneResult } from './bridge/outbox.js';
-export { buildUserErrorReply, truncateGraphemes } from './bridge/failure.js';
+export { ACK_MAX_CHARS, buildAckText, buildUserErrorReply, truncateGraphemes } from './bridge/failure.js';
 export type { QoderErrorKind } from './bridge/failure.js';
+export { ERROR_CLASS_LABEL, classifyQoderError } from './bridge/error-class.js';
+export type { QoderErrorClass, QoderErrorClassification, QoderSemanticFields } from './bridge/error-class.js';
+export { ErrorDedupStore } from './bridge/error-dedup.js';
+export type { ErrorDedupDecision, ErrorDedupOptions } from './bridge/error-dedup.js';
 export { detectNodeChange, nodeFingerprint, runPreflight } from './bridge/preflight.js';
 export type { NodeFingerprint, PreflightDeps, PreflightFailureKind, PreflightResult } from './bridge/preflight.js';
 export { OutboundSession } from './bridge/outbound.js';

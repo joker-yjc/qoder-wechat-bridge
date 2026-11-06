@@ -12,6 +12,10 @@ export interface DiagnosticInput {
   taskId: string;
   sessionId?: string;
   kind: QoderErrorKind | 'send';
+  /** 业务语义类别，与传输层 kind 正交记录 */
+  errorClass?: string;
+  /** 归一化后的 error_code */
+  errorCode?: string;
   exitCode?: number | null;
   durationMs?: number;
   stdout: string;
@@ -102,6 +106,8 @@ export function writeDiagnostic(input: DiagnosticInput, opts: DiagnosticOptions 
     `# taskId: ${input.taskId}`,
     `# sessionId: ${input.sessionId ?? ''}`,
     `# kind: ${input.kind}`,
+    `# errorClass: ${input.errorClass ?? ''}`,
+    `# errorCode: ${input.errorCode ?? ''}`,
     `# exitCode: ${input.exitCode ?? ''}`,
     `# durationMs: ${input.durationMs ?? ''}`,
     `# at: ${new Date(now).toISOString()}`,
