@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RunInfo } from '../../src/config.js';
 import {
+  describeOwner,
   findLaunchdServices,
   formatStopOutcome,
   isAlive,
@@ -44,6 +45,20 @@ describe('解析发现结果', () => {
     ].join('\n');
 
     expect(parsePsOutput(output).map((process) => process.pid)).toEqual([123, 125, 128]);
+  });
+
+  it('应该识别带运行器选项、env 与包管理器前缀的桥接进程', () => {
+    const output = [
+      '  201 node --inspect dist/cli.js run',
+      '  202 node --max-old-space-size=4096 /usr/local/bin/qoder-wechat run',
+      '  203 env node dist/cli.js run',
+      '  204 npm exec qoder-wechat run',
+      '  205 node dist/cli.js login',
+      '  206 vim dist/cli.js run',
+      '  207 node /other/src/cli.js run',
+    ].join('\n');
+
+    expect(parsePsOutput(output).map((process) => process.pid)).toEqual([201, 202, 203, 204]);
   });
 
   it('应该只保留桥接 launchd 标签并支持未运行实例', () => {
@@ -346,5 +361,43 @@ describe('真实进程探测', () => {
     expect(findLaunchdServices('linux')).toEqual([]);
     expect(Array.isArray(findLaunchdServices())).toBe(true);
     expect(launchdLabel(process.pid)).toBeNull();
+  });
+});
+
+describe('describeOwner', () => {
+  const owner = { pid: 123, stateDir: '/s', startedAt: '', cwd: '/' };
+
+  it('应该给出非 launchd 实例的重启命令', () => {
+    const text = describeOwner(owner, null);
+
+    expect(text).toContain('pid 123');
+    expect(text).toContain('/s');
+    expect(text).toContain('qoder-wechat stop && qoder-wechat run');
+  });
+
+  it('应该给出 launchd 托管实例的提示', () => {
+    const text = describeOwner(owner, 'com.jcyao.qoder-wechat-bridge');
+
+    expect(text).toContain('launchd：com.jcyao.qoder-wechat-bridge');
+    expect(text).toContain('KeepAlive');
+    expect(text).toContain('qoder-wechat stop');
+    expect(text).not.toContain('&& qoder-wechat run');
+  });
+
+  it('应该在状态目录缺失时显示未知', () => {
+    const text = describeOwner({ pid: 1, stateDir: '', startedAt: '' }, null);
+    expect(text).toContain('状态目录：(未知)');
+    expect(text).toContain('启动时间：(未知)');
+    expect(text).toContain('工作目录：(未知)');
+  });
+
+  it('应该输出启动时间与工作目录', () => {
+    const text = describeOwner(
+      { pid: 123, stateDir: '/s', startedAt: '2026-11-10T08:30:00.000Z', cwd: '/work' },
+      null,
+    );
+
+    expect(text).toContain('启动时间：2026-11-10T08:30:00.000Z');
+    expect(text).toContain('工作目录：/work');
   });
 });

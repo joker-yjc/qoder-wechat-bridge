@@ -203,4 +203,16 @@ describe('buildStatusLines', () => {
       expect(lines).toContain(prefix);
     }
   });
+
+  it('应该展示运行实例状态', () => {
+    const running = buildStatusLines(makeConfig(), makeState(), {
+      ...context,
+      runInfo: { pid: 321, ppid: 0, startedAt: '', cwd: '' },
+      runAlive: true,
+    }).join('\n');
+    expect(running).toContain('运行实例：pid 321（存活）');
+
+    const idle = buildStatusLines(makeConfig(), makeState(), context).join('\n');
+    expect(idle).toContain('运行实例：未运行');
+  });
 });

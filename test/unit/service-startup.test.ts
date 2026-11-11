@@ -13,6 +13,7 @@ import {
 } from '../../src/config.js';
 import { log } from '../../src/log.js';
 import { createBridgeRuntime, formatPreflightAlert, runService, type ServiceDeps } from '../../src/bridge/service.js';
+import { AlreadyRunningError } from '../../src/bridge/instance-lock.js';
 import type { PreflightResult } from '../../src/bridge/preflight.js';
 import { MessageItemType, MessageType } from '../../src/weixin/types.js';
 
@@ -310,5 +311,419 @@ describe('Node 指纹变化', () => {
 
     expect(warn).toHaveBeenCalledWith('Node 二进制已变化', expect.objectContaining({ reason: 'path' }));
     warn.mockRestore();
+  });
+});
+
+describe('实例互斥接入', () => {
+  it('应该拒绝同一状态目录的第二个实例', async () => {
+    const first = await runService(makeConfig(), makeDeps());
+    const secondDeps = makeDeps();
+
+    await expect(runService(makeConfig(), secondDeps)).rejects.toBeInstanceOf(AlreadyRunningError);
+    expect(secondDeps.writeRunInfo).not.toHaveBeenCalled();
+
+    first.stop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+
+  it('应该接管陈旧锁并继续启动', async () => {
+    const lockPath = path.join(root, 'state', 'run.lock');
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: 999_999,
+        ppid: 0,
+        startedAt: '',
+        cwd: '/',
+        botId: '',
+        stateDir: path.dirname(lockPath),
+        role: 'state',
+      }),
+    );
+
+    const deps = makeDeps();
+    const handle = await runService(makeConfig(), deps);
+    expect(deps.writeRunInfo).toHaveBeenCalled();
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    handle.stop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('应该在登录失败时释放已获取的锁', async () => {
+    const deps = makeDeps({ login: vi.fn(async () => ({ connected: false, message: 'cancel' })) });
+
+    await expect(runService({ ...makeConfig(), token: '' }, deps)).rejects.toThrow('微信登录未完成');
+    expect(fs.existsSync(path.join(root, 'state', 'run.lock'))).toBe(false);
+  });
+
+  it('应该在启动期（预检未完成）收到 SIGTERM 时释放锁并以 130 退出', async () => {    const deps = makeDeps({
+      runPreflight: vi.fn(
+        () =>
+          new Promise<PreflightResult>(() => {
+            // 保持挂起，模拟登录/预检尚未结束的启动期
+          }),
+      ),
+    });
+    const beforeSigint = process.listeners('SIGINT');
+    const beforeSigterm = process.listeners('SIGTERM');
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    const lockPath = path.join(root, 'state', 'run.lock');
+    void runService(makeConfig(), deps);
+    const startedAt = Date.now();
+    while (!fs.existsSync(lockPath)) {
+      if (Date.now() - startedAt > 2_000) throw new Error('等待锁文件超时');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // 锁文件创建与锁句柄登记之间隔了一个微任务，等它落定后再发信号
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    process.emit('SIGTERM');
+
+    expect(exit).toHaveBeenCalledWith(130);
+    expect(fs.existsSync(lockPath)).toBe(false);
+
+    // process.exit 被 mock 后早期处理器仍在，手工摘掉避免污染后续用例
+    for (const listener of process.listeners('SIGINT')) {
+      if (!beforeSigint.includes(listener)) process.off('SIGINT', listener as () => void);
+    }
+    for (const listener of process.listeners('SIGTERM')) {
+      if (!beforeSigterm.includes(listener)) process.off('SIGTERM', listener as () => void);
+    }
+    exit.mockRestore();
+  });
+
+  it('应该在 run.json 指向运行中的旧版本实例时拒绝启动', async () => {
+    const deps = makeDeps({
+      readRunInfo: vi.fn(() => ({ pid: 55_555, ppid: 0, startedAt: '2026-11-10T00:00:00.000Z', cwd: '/old' })),
+      isAlive: () => true,
+      isBridgeProcess: () => true,
+    });
+
+    await expect(runService(makeConfig(), deps)).rejects.toBeInstanceOf(AlreadyRunningError);
+    expect(deps.writeRunInfo).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(root, 'state', 'run.lock'))).toBe(false);
+  });
+
+  it('应该清理陈旧的 run.json 并继续启动', async () => {
+    const deps = makeDeps({
+      readRunInfo: vi.fn(() => ({ pid: 999_999, ppid: 0, startedAt: '', cwd: '/gone' })),
+      isAlive: () => false,
+    });
+
+    const handle = await runService(makeConfig(), deps);
+    expect(deps.clearRunInfo).toHaveBeenCalledWith(999_999);
+    expect(deps.writeRunInfo).toHaveBeenCalled();
+
+    await handle.stop();
+  });
+
+  it('应该在缺少 botId 时提示跨状态目录互斥不可用', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const handle = await runService(makeConfig(), makeDeps());
+
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).toContain('botId');
+
+    await handle.stop();
+    warn.mockRestore();
+  });
+
+  it('应该在预检抛错时释放锁并摘掉信号监听', async () => {
+    const before = process.listenerCount('SIGTERM');
+    const deps = makeDeps({
+      runPreflight: vi.fn(async () => {
+        throw new Error('preflight boom');
+      }),
+    });
+
+    await expect(runService(makeConfig(), deps)).rejects.toThrow('preflight boom');
+    expect(fs.existsSync(path.join(root, 'state', 'run.lock'))).toBe(false);
+    expect(process.listenerCount('SIGTERM')).toBe(before);
+  });
+
+  it('应该在停止时等待在途任务结束再释放锁', async () => {    let delivered = false;
+    const message = {
+      message_type: MessageType.USER,
+      from_user_id: 'u',
+      message_id: 'm1',
+      context_token: 'ctx',
+      item_list: [{ type: MessageItemType.TEXT, text_item: { text: 'hi' } }],
+    };
+    const getUpdates = vi.fn(async () => {
+      if (!delivered) {
+        delivered = true;
+        return { ret: 0, msgs: [message], get_updates_buf: 'buf' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ret: 0, msgs: [], get_updates_buf: 'buf' };
+    });
+    let started = false;
+    const runQoder = vi.fn(async (input: { onStart?: (cancel: () => void) => void }) => {
+      started = true;
+      input.onStart?.(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return { ok: true, text: 'reply', sessionId: 's1', durationMs: 1 };
+    });
+
+    const handle = await runService(makeConfig(), makeDeps({ getUpdates, runQoder }));
+    const waitStart = Date.now();
+    while (!started) {
+      if (Date.now() - waitStart > 2_000) throw new Error('等待任务启动超时');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const lockPath = path.join(root, 'state', 'run.lock');
+    const stopping = handle.stop();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    await stopping;
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('应该在排空超时时保留锁而不是带着未完成任务释放', async () => {
+    let delivered = false;
+    const message = {
+      message_type: MessageType.USER,
+      from_user_id: 'u',
+      message_id: 'm-long',
+      context_token: 'ctx',
+      item_list: [{ type: MessageItemType.TEXT, text_item: { text: 'hi' } }],
+    };
+    const getUpdates = vi.fn(async () => {
+      if (!delivered) {
+        delivered = true;
+        return { ret: 0, msgs: [message], get_updates_buf: 'buf' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ret: 0, msgs: [], get_updates_buf: 'buf' };
+    });
+    let started = false;
+    const runQoder = vi.fn(async (input: { onStart?: (cancel: () => void) => void }) => {
+      started = true;
+      input.onStart?.(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { ok: true, text: 'reply', sessionId: 's1', durationMs: 1 };
+    });
+    const errorLog = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+
+    const handle = await runService(
+      makeConfig(),
+      makeDeps({ getUpdates, runQoder, drainTimeoutMs: 50 }),
+    );
+    const waitStart = Date.now();
+    while (!started) {
+      if (Date.now() - waitStart > 2_000) throw new Error('等待任务启动超时');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const lockPath = path.join(root, 'state', 'run.lock');
+    await handle.stop();
+
+    // 超时当下必须保留锁；任务落定后的补释放见「应该在排空超时后的任务落定时补释放实例锁」
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(JSON.stringify(errorLog.mock.calls)).toContain('保留实例锁');
+
+    errorLog.mockRestore();
+  });
+
+  it('应该在收到一次 SIGTERM 后由主循环收尾并释放锁', async () => {
+    const deps = makeDeps();
+    const handle = await runService(makeConfig(), deps);
+    const lockPath = path.join(root, 'state', 'run.lock');
+
+    process.emit('SIGTERM');
+    const startedAt = Date.now();
+    while (fs.existsSync(lockPath)) {
+      if (Date.now() - startedAt > 3_000) throw new Error('等待释放锁超时');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(deps.clearRunInfo).toHaveBeenCalledWith(process.pid);
+    await handle.stop();
+  });
+
+  it('应该在第二次 SIGTERM 时立即退出并释放锁', async () => {
+    const beforeSigint = process.listeners('SIGINT');
+    const beforeSigterm = process.listeners('SIGTERM');
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const handle = await runService(makeConfig(), makeDeps());
+    const lockPath = path.join(root, 'state', 'run.lock');
+
+    process.emit('SIGTERM');
+    process.emit('SIGTERM');
+
+    expect(exit).toHaveBeenCalledWith(130);
+    expect(fs.existsSync(lockPath)).toBe(false);
+
+    for (const listener of process.listeners('SIGINT')) {
+      if (!beforeSigint.includes(listener)) process.off('SIGINT', listener as () => void);
+    }
+    for (const listener of process.listeners('SIGTERM')) {
+      if (!beforeSigterm.includes(listener)) process.off('SIGTERM', listener as () => void);
+    }
+    exit.mockRestore();
+    await handle.stop();
+  });
+
+  it('应该在停止后不再执行队列中未启动的任务', async () => {
+    const makeMessage = (id: string) => ({
+      message_type: MessageType.USER,
+      from_user_id: 'u',
+      message_id: id,
+      context_token: 'ctx',
+      item_list: [{ type: MessageItemType.TEXT, text_item: { text: `hi-${id}` } }],
+    });
+    let delivered = false;
+    let qoderCalls = 0;
+    const runQoder = vi.fn(async (input: { onStart?: (cancel: () => void) => void }) => {
+      qoderCalls += 1;
+      input.onStart?.(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return { ok: true, text: 'reply', sessionId: 's1', durationMs: 1 };
+    });
+    // 同一条队列里排两个任务：第一个执行中收到停止信号，第二个不得起跑
+    const getUpdates = vi.fn(async () => {
+      if (!delivered) {
+        delivered = true;
+        return { ret: 0, msgs: [makeMessage('m1'), makeMessage('m2')], get_updates_buf: 'buf' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ret: 0, msgs: [], get_updates_buf: 'buf' };
+    });
+    const beforeSigint = process.listeners('SIGINT');
+    const beforeSigterm = process.listeners('SIGTERM');
+    const handle = await runService(makeConfig(), makeDeps({ getUpdates, runQoder }));
+
+    const startedAt = Date.now();
+    while (qoderCalls < 1) {
+      if (Date.now() - startedAt > 2_000) throw new Error('等待任务启动超时');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    process.emit('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    expect(qoderCalls).toBe(1);
+
+    for (const listener of process.listeners('SIGINT')) {
+      if (!beforeSigint.includes(listener)) process.off('SIGINT', listener as () => void);
+    }
+    for (const listener of process.listeners('SIGTERM')) {
+      if (!beforeSigterm.includes(listener)) process.off('SIGTERM', listener as () => void);
+    }
+    await handle.stop();
+  });
+
+  it('应该在排空超时后的任务落定时补释放实例锁', async () => {
+    const lockPath = path.join(root, 'state', 'run.lock');
+    let delivered = false;
+    const getUpdates = vi.fn(async () => {
+      if (!delivered) {
+        delivered = true;
+        return {
+          ret: 0,
+          msgs: [
+            {
+              message_type: MessageType.USER,
+              from_user_id: 'u',
+              message_id: 'm-late',
+              context_token: 'ctx',
+              item_list: [{ type: MessageItemType.TEXT, text_item: { text: 'hi' } }],
+            },
+          ],
+          get_updates_buf: 'buf',
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ret: 0, msgs: [], get_updates_buf: 'buf' };
+    });
+    let started = false;
+    const runQoder = vi.fn(async (input: { onStart?: (cancel: () => void) => void }) => {
+      started = true;
+      input.onStart?.(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return { ok: true, text: 'reply', sessionId: 's1', durationMs: 1 };
+    });
+
+    const handle = await runService(
+      makeConfig(),
+      makeDeps({ getUpdates, runQoder, drainTimeoutMs: 40 }),
+    );
+    const startedAt = Date.now();
+    while (!started) {
+      if (Date.now() - startedAt > 2_000) throw new Error('等待任务启动超时');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    // 排空上限 40ms < 任务 120ms：stop 返回时锁仍被持有
+    await handle.stop();
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    // 任务落定后必须补释放，否则同进程内重启会被自身的防重入拒绝
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('应该在停止后丢弃已拉取但尚未交给 Qoder 的消息', async () => {
+    // 一批两条：m1 带附件（下载中收到停止信号），m2 在停止后才轮到入站
+    const textWithImage = (id: string) => ({
+      message_type: MessageType.USER,
+      from_user_id: 'u',
+      message_id: id,
+      context_token: 'ctx',
+      item_list: [
+        { type: MessageItemType.TEXT, text_item: { text: `hi-${id}` } },
+        { type: MessageItemType.IMAGE, image_item: { media: { aes_key: 'k', encrypted_file_id: 'f', filesize: 1 } } },
+      ],
+    });
+    let delivered = false;
+    let qoderCalls = 0;
+    let mediaDownloads = 0;
+    const runQoder = vi.fn(async (input: { onStart?: (cancel: () => void) => void }) => {
+      qoderCalls += 1;
+      input.onStart?.(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ok: true, text: 'reply', sessionId: 's1', durationMs: 1 };
+    });
+    const getUpdates = vi.fn(async () => {
+      if (!delivered) {
+        delivered = true;
+        return { ret: 0, msgs: [textWithImage('m1'), textWithImage('m2')], get_updates_buf: 'buf' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ret: 0, msgs: [], get_updates_buf: 'buf' };
+    });
+    const downloadItemMedia = vi.fn(async () => {
+      mediaDownloads += 1;
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return null;
+    });
+    const beforeSigint = process.listeners('SIGINT');
+    const beforeSigterm = process.listeners('SIGTERM');
+    const handle = await runService(
+      makeConfig(),
+      makeDeps({ getUpdates, runQoder, downloadItemMedia }),
+    );
+
+    // 等两条消息进入本轮批处理，再在附件下载期间停止
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    process.emit('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    // 停止后：m1 的附件照常下载，m2 既不下载也不起跑
+    expect(mediaDownloads).toBe(1);
+    expect(qoderCalls).toBe(0);
+
+    for (const listener of process.listeners('SIGINT')) {
+      if (!beforeSigint.includes(listener)) process.off('SIGINT', listener as () => void);
+    }
+    for (const listener of process.listeners('SIGTERM')) {
+      if (!beforeSigterm.includes(listener)) process.off('SIGTERM', listener as () => void);
+    }
+    await handle.stop();
   });
 });

@@ -59,6 +59,35 @@ const LAUNCHD_LABEL_PATTERN = /(qoder.*wechat|qoder.*bridge|wechat.*bridge)/i;
 /** shell 解释器名，含 `-c` 包装命令时不应被当成桥接进程 */
 const SHELL_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'fish', 'ksh', 'csh', 'tcsh']);
 
+/** 允许作为桥接进程首段的可执行文件名（JS 运行器、包管理器与 CLI 自身） */
+const RUNTIME_NAMES = new Set([
+  'node',
+  'nodejs',
+  'bun',
+  'deno',
+  'env',
+  'npm',
+  'npx',
+  'pnpm',
+  'yarn',
+  'qoder-wechat',
+  'qoder-wechat.js',
+]);
+
+/** 桥接入口脚本名 */
+const BRIDGE_SCRIPTS = new Set(['qoder-wechat', 'qoder-wechat.js', 'cli.js']);
+
+/**
+ * 判断 cli.js 是否位于 `dist/` 下，避免把别的项目的 cli.js 当成本包进程
+ * @param token - 脚本路径片段
+ * @returns 是否位于 dist 目录
+ */
+function isDistScript(token: string): boolean {
+  const segments = token.split(/[\\/]/).filter(Boolean);
+  const parent = segments[segments.length - 2];
+  return parent !== undefined && parent.toLowerCase() === 'dist';
+}
+
 /**
  * 取可执行文件 basename，兼容 Windows 路径与 .exe
  * @param token - 命令行片段
@@ -73,29 +102,65 @@ function basename(token: string): string {
  * 判断命令行是否为桥接 run 进程
  *
  * 只看真正的 argv 首段，避免把 `zsh -c "... node dist/cli.js run ..."` 这类
- * 包装命令误判成第二个实例。
+ * 包装命令误判成第二个实例；桥接脚本之后的第一个非选项 token 必须恰好是 `run`，
+ * 因此 `node --inspect`、`env node`、`npm exec` 等前缀形态都能识别。
  * @param command - 进程命令行
  * @returns 是否匹配
  */
 function isBridgeCommand(command: string): boolean {
-  const tokens = command.trim().split(/\s+/);
+  const tokens = command.trim().split(/\s+/).filter(Boolean);
   const first = tokens[0];
   if (!first) return false;
   const executable = basename(first);
   if (SHELL_NAMES.has(executable)) return false;
+  if (!RUNTIME_NAMES.has(executable)) return false;
 
-  if (executable === 'qoder-wechat' || executable === 'qoder-wechat.js') {
-    return tokens[1] === 'run';
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token || !BRIDGE_SCRIPTS.has(basename(token))) continue;
+    if (basename(token) === 'cli.js' && !isDistScript(token)) continue;
+    const next = tokens.slice(i + 1).find((item) => !item.startsWith('-'));
+    return next === 'run';
   }
-
-  if (executable === 'node' || executable === 'nodejs') {
-    const script = tokens[1];
-    if (!script) return false;
-    const scriptName = basename(script);
-    return (scriptName === 'qoder-wechat' || scriptName === 'qoder-wechat.js' || scriptName === 'cli.js') && tokens[2] === 'run';
-  }
-
   return false;
+}
+
+/**
+ * 实例归属信息（与 instance-lock 的 LockRecord 结构兼容，避免循环依赖）
+ */
+export interface InstanceOwner {
+  /** 实例 pid */
+  pid: number;
+  /** 该实例使用的状态目录 */
+  stateDir: string;
+  /** 启动时间 */
+  startedAt: string;
+  /** 启动时的工作目录 */
+  cwd?: string;
+}
+
+/**
+ * 生成"实例已在运行"的中文说明
+ * @param owner - 持有实例锁的进程信息
+ * @param launchdLabelValue - launchd 标签；非托管为 null
+ * @returns 可直接输出的多行文本
+ */
+export function describeOwner(owner: InstanceOwner, launchdLabelValue: string | null): string {
+  const lines = [
+    `已在运行：pid ${owner.pid}${launchdLabelValue ? `（launchd：${launchdLabelValue}）` : ''}`,
+    `状态目录：${owner.stateDir || '(未知)'}`,
+    `启动时间：${owner.startedAt || '(未知)'}`,
+    `工作目录：${owner.cwd || '(未知)'}`,
+  ];
+  if (launchdLabelValue) {
+    lines.push('该实例由 launchd 托管，KeepAlive 会自动拉起。如需重启：');
+    lines.push('  qoder-wechat stop');
+    lines.push('（launchd 托管的实例需要按 stop 输出里的 bootout 命令操作）');
+  } else {
+    lines.push('如需重启：');
+    lines.push('  qoder-wechat stop && qoder-wechat run');
+  }
+  return lines.join('\n');
 }
 
 /**
