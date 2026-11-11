@@ -2,7 +2,7 @@
  * status 输出：把配置与运行状态格式化为终端文本
  * @module status
  */
-import type { Config, State } from './config.js';
+import type { Config, RunInfo, State } from './config.js';
 import { ERROR_CLASS_LABEL } from './bridge/error-class.js';
 
 /** status 上下文 */
@@ -12,6 +12,10 @@ export interface StatusContext {
   personaInfo: string;
   inbox: { bytes: number; files: number };
   home: string;
+  /** 运行记录；缺失表示未运行 */
+  runInfo?: RunInfo | null;
+  /** 运行记录中的 pid 是否存活 */
+  runAlive?: boolean;
 }
 
 /**
@@ -81,6 +85,7 @@ export function buildStatusLines(config: Config, state: State, context: StatusCo
     `权限模式：${config.permissionMode}`,
     `人设：${context.personaInfo}`,
     `附件目录：${config.inboxDir}（${formatBytes(context.inbox.bytes)}，${context.inbox.files} 个文件）`,
+    `运行实例：${context.runInfo && context.runAlive ? `pid ${context.runInfo.pid}（存活）` : '未运行'}`,
     `会话数：${Object.keys(state.sessions).length}`,
     queueLine,
     `隔离区：${state.quarantine.length} 条`,

@@ -19,6 +19,8 @@
 | 配置（含 token，600） | `~/.config/qoder-wechat-bridge/config.json` |
 | 人设文件（可选） | `~/.config/qoder-wechat-bridge/persona.md` |
 | 状态（游标、会话映射、补发队列） | `~/.local/state/qoder-wechat-bridge/state.json` |
+| 实例锁（同状态目录互斥，600） | `~/.local/state/qoder-wechat-bridge/run.lock` |
+| bot 级锁（跨状态目录同 bot 互斥，600） | `~/.local/state/qoder-wechat-bridge/instances/<sha1(botId) 前 16 位>.lock` |
 | 待补发提醒（notify 排队） | `~/.local/state/qoder-wechat-bridge/pending-notifications.jsonl` |
 | 日志 | `~/.local/state/qoder-wechat-bridge/logs/bridge-YYYY-MM-DD.jsonl` |
 | 失败诊断（qodercli 输出，7 天） | `~/.local/state/qoder-wechat-bridge/logs/diagnostics/YYYY-MM-DD/` |
@@ -38,6 +40,16 @@ node dist/cli.js run --cwd ~/projects/my-app
 ```
 
 停止：`Ctrl+C`，或另开终端执行 `node dist/cli.js stop`。手动实例会收到 SIGTERM，`stop` 会取消正在执行的 qodercli 任务并等它落定（正常退出 0，超时 1）；launchd 托管时不发信号（发了会被 KeepAlive 重新拉起），而是打印 `launchctl bootout`、验证、恢复和兜底命令，并返回 2。运行记录失效时会继续扫进程和 launchd 标签；多实例只报告冲突并列出每个 pid 的 `kill -TERM` 命令。
+
+### 实例互斥与重启重叠
+
+`run` 在开始长轮询之前先占两把锁：`stateDir/run.lock`（同一状态目录只允许一个实例）与 `~/.local/state/qoder-wechat-bridge/instances/<sha1(botId) 前 16 位>.lock`（跨状态目录跑同一个 bot 也会被拦）。已有存活实例时拒绝启动并退出码 1，打印对方 pid、状态目录、启动时间、工作目录与处置命令；launchd 在跑而你想手动起，就是这个提示，不是启动失败。
+
+停服时的顺序是：停止入站 → 取消已启动的 qodercli 任务 → 等队列排空（上限 3 秒）→ 清 `run.json` 并释放锁。排空超时则**保留锁**，等任务落定后补释放；此时立刻再起会被拒绝，最长要等到在途任务结束（上界 `QWB_TIMEOUT_MS`，默认 10 分钟）。launchd 场景由 KeepAlive 的 30s 节流自然重试，不需要人工干预。
+
+锁内 pid 仍存活但命令行看起来不像桥接进程时（pid 被无关进程占用、或变成僵尸进程），实现**不会删别人的锁**，只会拒绝启动。确认无实例后按提示执行 `rm "<锁文件>"` 即可恢复——这是唯一的人工出口。
+
+**停止窗口内已拉到的消息会被丢弃**：`get_updates_buf` 在轮询阶段就已推进，而 iLink 不再重投，所以正在下载附件、或还排在队列里没起跑的消息不会再被处理，只留一条 info 日志。这属于设计取舍：宁可少回一条，也不允许两个实例同时写状态。要让停服期间的消息不丢，需要入站队列持久化（未排期）。
 
 ### Windows
 
@@ -97,6 +109,10 @@ node dist/cli.js run --permission-mode dont_ask
 | 隔离区有消息 | 某条消息连续永久失败，已停止自动补发 | `status` 查看数量；手动恢复需停服编辑 `state.json` 的 `quarantine`，或等 7 天过期 |
 | outbox 超限 / 过期 | 补发队列达到 200 条或 24 小时 | 查看日志中的 `outbox 超限` / `消息已过期`，旧消息会被丢弃 |
 | `stop` 退出码 2 | launchd 托管，未真正停止 | 执行它打印的 `launchctl bootout gui/<uid>/<label>` |
+| 启动即提示「已在运行：pid …」 | 已有存活实例持有 `run.lock` / bot 锁；或旧版实例（0.3.0 及更早不写锁）仍在跑，被 `run.json` 兜底拦下 | 按输出先停旧实例（launchd 用 `bootout`）再起新版；反复出现时用 `pgrep -fl "qoder-wechat run"` 确认 |
+| 执行 `stop` 后新实例一时起不来 | 在途任务 3 秒内没排空，锁按设计保留，等任务落定才补释放 | 属预期。等任务结束（上界 `QWB_TIMEOUT_MS`，默认 10 分钟）；急用时再发一次停止信号，第二次会立即退出 |
+| 拒绝启动且对方 pid 看着像无关进程 | pid 被复用或已成僵尸；实现不删别人的锁 | 确认机器上没有桥接实例后，执行提示里给出的 `rm "<锁文件>"` |
+| 刚重启过，某条消息没回复 | 停止窗口内已拉取但未起跑的消息被丢弃（游标已推进，iLink 不再重投） | 属预期行为；请对方重发。详见 §3「实例互斥与重启重叠」 |
 | `stop` 退出码 1 | 发出信号但进程未退出 | 再执行一次 `stop`，第二次信号会立即结束 |
 | 语音只收到"没有转写"的提示 | 平台未提供该条语音的转写 | 让用户重发或改用文字；要 100% 覆盖需接 ASR |
 | `stop` 回"没有运行记录" | 0.1.x 旧版本只依赖 `run.json` | 0.2.0 会继续扫进程和 launchd 标签；仍失败时用 `pgrep -fl "qoder-wechat run"` / `launchctl list` 手工确认 |
@@ -160,6 +176,8 @@ tail -f ~/.local/state/qoder-wechat-bridge/logs/bridge-$(date +%F).jsonl
 5. 重启服务后再触发一次同类失败：应重新收到完整提示（去重窗口在内存，重启即重置，属预期）；
 6. 上述全过程 `status` 的待补发与隔离区计数始终为 0（错误提示不入队）；
 7. 一期 7 条验收标准全部回归通过。
+
+0.4.0 实例互斥与本轮加固的自动化验收记录见 `.specs/20261110_桥接运维加固/verification.md`（385 tests，Lines 98.46%）；真机 V1 已在 launchd 实例在跑时验证，V2 未停服。
 
 ## 7. 安全
 

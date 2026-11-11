@@ -7,8 +7,11 @@ import {
   ensureDirs,
   loadConfig,
   loadState,
+  readRunInfo,
+  runInfoPath,
   saveConfig,
   saveState,
+  stateDir,
   writeRunInfo,
   type Config,
   type OutboxItem,
@@ -39,13 +42,24 @@ import { buildAckText, buildUserErrorReply } from './failure.js';
 import { ErrorDedupStore } from './error-dedup.js';
 import { redactSensitive, pruneDiagnostics } from '../diagnostics.js';
 import { detectNodeChange, nodeFingerprint, runPreflight, type PreflightResult } from './preflight.js';
+import { acquireInstanceLock, AlreadyRunningError, type LockHandle, type LockRecord } from './instance-lock.js';
+import { isAlive, isBridgeProcess, launchdLabel } from './lifecycle.js';
 import { takePending } from '../notify.js';
 import { loadPersona } from '../persona.js';
 
+/** 实例锁等待窗口，覆盖 launchd 重启重叠 */
+const LOCK_WAIT_MS = 5_000;
+
+/** 退出前等待队列排空的上限，必须小于取锁窗口，避免后继实例等不到 */
+const DRAIN_TIMEOUT_MS = 3_000;
+
 /** 桥接服务句柄 */
 export interface BridgeHandle {
-  /** 停止服务 */
-  stop: () => void;
+  /**
+   * 停止服务；返回时已停止接收并排空在途任务
+   * 排空超时时实例锁先保留，待任务落定后补释放；同进程内立即重启会被防重入拒绝
+   */
+  stop: () => Promise<void>;
   /** 当前生效配置 */
   config: Config;
 }
@@ -68,6 +82,15 @@ export interface ServiceDeps {
   getUpdates?: typeof getUpdates;
   writeRunInfo?: typeof writeRunInfo;
   clearRunInfo?: typeof clearRunInfo;
+  readRunInfo?: typeof readRunInfo;
+  isAlive?: typeof isAlive;
+  isBridgeProcess?: typeof isBridgeProcess;
+  /** 是否处于用户主动停止流程；默认恒为 false，runService 注入停止状态 */
+  isStopping?: () => boolean;
+  /** 是否允许落盘；默认恒为 true，runService 在释放锁后置 false */
+  canPersist?: () => boolean;
+  /** 排空在途任务的等待上限，默认 3s；单测可缩短 */
+  drainTimeoutMs?: number;
   nodeFingerprint?: typeof nodeFingerprint;
   now?: () => number;
   onSessionExpired?: () => void;
@@ -215,8 +238,14 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
     redact: redactSensitive,
   });
 
+  /** 是否处于用户主动停止流程；为 true 时不再入队新任务（会话过期不算停止） */
+  const isStoppingFn = deps.isStopping ?? ((): boolean => false);
+  /** 是否允许落盘；实例锁释放后必须为 false，保证「释放后不再写 state.json」 */
+  const canPersistFn = deps.canPersist ?? ((): boolean => true);
+
   /** 持久化状态 */
   const persistState = (): void => {
+    if (!canPersistFn()) return;
     try {
       saveState(state);
     } catch (err) {
@@ -432,6 +461,11 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
     attachments: string[] = [],
     taskId?: string,
   ): Promise<void> => {
+    // 停止后队列里尚未启动的任务不再起跑：cancelAllTasks 只覆盖已启动的任务
+    if (isStoppingFn()) {
+      log.info('服务已停止，跳过排队任务', { userId });
+      return;
+    }
     const id = taskId ?? makeTaskId(now());
     const session = new OutboundSession({
       state,
@@ -825,6 +859,12 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
       }
     }
 
+    // 停止中不再下载附件、不写入游标、不入队新任务
+    if (isStoppingFn()) {
+      log.info('服务已停止，丢弃入站消息', { from, preview: text.slice(0, 40) || '[附件]' });
+      return;
+    }
+
     const contextToken = msg.context_token ?? '';
     if (contextToken) {
       state.contextTokens[from] = contextToken;
@@ -904,6 +944,10 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
       log.info('消息无可用内容，跳过', { from });
       return;
     }
+    if (isStoppingFn()) {
+      log.info('服务已停止，丢弃待入队任务', { from });
+      return;
+    }
     log.info('收到授权消息', {
       from,
       chars: text.length,
@@ -972,6 +1016,7 @@ export async function runService(
   const getUpdatesFn = deps.getUpdates ?? getUpdates;
   const writeRunInfoFn = deps.writeRunInfo ?? writeRunInfo;
   const clearRunInfoFn = deps.clearRunInfo ?? clearRunInfo;
+  const readRunInfoFn = deps.readRunInfo ?? readRunInfo;
   const runPreflightFn = deps.runPreflight ?? runPreflight;
   const sendTextFn = deps.sendText ?? sendText;
 
@@ -991,67 +1036,197 @@ export async function runService(
   let running = true;
   /** 用于中断长轮询，保证 Ctrl+C 后立即退出 */
   const abortController = new AbortController();
+  /** 已获取的实例锁；释放幂等 */
+  const lockHandles: LockHandle[] = [];
+  /** 锁是否已释放；释放后禁止再写 state.json */
+  let lockReleased = false;
+  const releaseLocks = (): void => {
+    lockReleased = true;
+    for (const lock of lockHandles.splice(0)) lock.release();
+  };
 
-  if (!config.token) {
-    log.warn('尚未登录微信，先执行扫码登录');
-    const result = await loginFn();
-    log.info(result.message);
-    if (!result.connected) throw new Error('微信登录未完成');
-    config = { ...loadConfig(), ...overrides };
-  }
+  /** 用户主动停止流程；会话过期/循环异常不算 */
+  let stopping = false;
+  /** runtime 创建后才有排空能力，创建前 stop/信号无需等待 */
+  let waitForIdleFn: (() => Promise<void>) | undefined;
+  let drainPromise: Promise<boolean> | undefined;
+  /** 真正的排空 promise；drain 超时后仍可用它在任务落定时补释放锁 */
+  let idlePromise: Promise<void> | undefined;
+  const drainTimeoutMs = deps.drainTimeoutMs ?? DRAIN_TIMEOUT_MS;
 
-  const runtime = createBridgeRuntime(config, state, {
-    ...deps,
-    onSessionExpired: () => {
-      running = false;
-      deps.onSessionExpired?.();
-    },
-  });
-  runtime.prune();
-
-  const preflight = await runPreflightFn({
-    qoderBin: config.qoderBin,
-    versionTimeoutMs: config.preflightVersionTimeoutMs,
-  });
-  if (preflight.ok) {
-    log.info('启动预检通过', {
-      nodeVersion: preflight.node.version,
-      nodePath: preflight.node.execPath,
-      qoderPath: preflight.qodercli?.path ?? '',
-      qoderVersion: preflight.qodercli?.version ?? '',
-    });
-  } else {
-    log.error('启动预检失败', {
-      failures: preflight.failures.map((failure) => failure.kind),
-      nodeVersion: preflight.node.version,
-      nodePath: preflight.node.execPath,
-      qoderPath: preflight.qodercli?.path ?? '',
-    });
-    const owner = runtime.getConfig().ownerUserId;
-    const token = owner ? runtime.getState().contextTokens[owner] ?? '' : '';
-    if (token) {
+  /**
+   * 排空消息队列
+   * @returns true 表示队列已空；false 表示超时或读取失败，调用方不得释放锁
+   * 多次调用共享同一个 promise，先到者未排空时后续调用不得提前释放锁
+   */
+  const drain = (): Promise<boolean> => {
+    drainPromise ??= (async (): Promise<boolean> => {
+      const waitForIdle = waitForIdleFn;
+      if (!waitForIdle) return true;
+      const timedOut = Symbol('timeout');
+      const idle = waitForIdle();
+      idlePromise = idle;
       try {
-        await sendTextFn({
-          baseUrl: runtime.getConfig().baseUrl,
-          token: runtime.getConfig().token,
-          toUserId: owner,
-          text: formatPreflightAlert(preflight),
-          contextToken: token,
-        });
+        const result = await Promise.race([
+          idle.then(() => true),
+          new Promise<typeof timedOut>((resolve) => {
+            const timer = setTimeout(() => resolve(timedOut), drainTimeoutMs);
+            timer.unref();
+          }),
+        ]);
+        return result === true;
       } catch (err) {
-        log.warn('预检告警发送失败', { error: String(err) });
+        log.warn('等待任务结束失败', { error: String(err) });
+        return false;
+      }
+    })();
+    return drainPromise;
+  };
+
+  // 登录/预检阶段可能持续数十秒，主信号处理器此时尚未挂上，先挂早期处理器保证锁一定被释放
+  const onEarlySignal = (): void => {
+    log.info('启动期收到停止信号，释放实例锁后退出');
+    releaseLocks();
+    process.exit(130);
+  };
+  process.on('SIGINT', onEarlySignal);
+  process.on('SIGTERM', onEarlySignal);
+
+  /**
+   * 查询 launchd 标签，失败不阻断
+   * @param pid - 进程 id
+   * @returns 标签或 null
+   */
+  const safeLaunchdLabel = (pid: number): string | null => {
+    try {
+      return launchdLabel(pid);
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * 兼容升级窗口：旧版本实例只写 run.json、不写锁
+   * 存活则拒绝启动，陈旧则清理后继续
+   */
+  const refuseLegacyInstance = (): void => {
+    const info = readRunInfoFn();
+    if (!info || info.pid === process.pid) return;
+    const aliveFn = deps.isAlive ?? isAlive;
+    const bridgeFn = deps.isBridgeProcess ?? isBridgeProcess;
+    const runningLegacy = aliveFn(info.pid) && (process.platform === 'win32' || bridgeFn(info.pid));
+    if (!runningLegacy) {
+      log.warn('清理陈旧的运行记录', { pid: info.pid });
+      clearRunInfoFn(info.pid);
+      return;
+    }
+    const owner: LockRecord = {
+      pid: info.pid,
+      ppid: info.ppid,
+      startedAt: info.startedAt,
+      cwd: info.cwd,
+      botId: '',
+      stateDir: stateDir(),
+      role: 'state',
+    };
+    log.error('拒绝启动：run.json 指向运行中的旧版本实例', {
+      selfPid: process.pid,
+      ownerPid: info.pid,
+      basis: 'run.json',
+      lockFile: runInfoPath(),
+    });
+    throw new AlreadyRunningError(owner, safeLaunchdLabel(info.pid), 0, runInfoPath());
+  };
+
+  let runtime!: BridgeRuntime;
+  try {
+    // 先占状态目录锁，尽早挡掉同目录重复启动；botId 未知时只做这一层
+    lockHandles.push(await acquireInstanceLock({ stateDir: stateDir(), botId: '', mode: 'state' }));
+    refuseLegacyInstance();
+
+    if (!config.token) {
+      log.warn('尚未登录微信，先执行扫码登录');
+      const result = await loginFn();
+      log.info(result.message);
+      if (!result.connected) throw new Error('微信登录未完成');
+      config = { ...loadConfig(), ...overrides };
+    }
+
+    if (config.botId) {
+      // 扫码登录可能持续数十秒，bot 锁的等待窗口从登录结束后重新起算
+      lockHandles.push(
+        await acquireInstanceLock({
+          stateDir: stateDir(),
+          botId: config.botId,
+          mode: 'bot',
+          deadline: Date.now() + LOCK_WAIT_MS,
+        }),
+      );
+    } else {
+      log.warn('配置缺少 botId，跨状态目录互斥不可用', { stateDir: stateDir() });
+    }
+
+    runtime = createBridgeRuntime(config, state, {
+      ...deps,
+      isStopping: () => stopping,
+      canPersist: () => !lockReleased,
+      onSessionExpired: () => {
+        running = false;
+        deps.onSessionExpired?.();
+      },
+    });
+    runtime.prune();
+    waitForIdleFn = runtime.waitForIdle;
+
+    const preflight = await runPreflightFn({
+      qoderBin: config.qoderBin,
+      versionTimeoutMs: config.preflightVersionTimeoutMs,
+    });
+    if (preflight.ok) {
+      log.info('启动预检通过', {
+        nodeVersion: preflight.node.version,
+        nodePath: preflight.node.execPath,
+        qoderPath: preflight.qodercli?.path ?? '',
+        qoderVersion: preflight.qodercli?.version ?? '',
+      });
+    } else {
+      log.error('启动预检失败', {
+        failures: preflight.failures.map((failure) => failure.kind),
+        nodeVersion: preflight.node.version,
+        nodePath: preflight.node.execPath,
+        qoderPath: preflight.qodercli?.path ?? '',
+      });
+      const owner = runtime.getConfig().ownerUserId;
+      const token = owner ? runtime.getState().contextTokens[owner] ?? '' : '';
+      if (token) {
+        try {
+          await sendTextFn({
+            baseUrl: runtime.getConfig().baseUrl,
+            token: runtime.getConfig().token,
+            toUserId: owner,
+            text: formatPreflightAlert(preflight),
+            contextToken: token,
+          });
+        } catch (err) {
+          log.warn('预检告警发送失败', { error: String(err) });
+        }
       }
     }
-  }
 
-  log.info('桥接服务启动', {
-    baseUrl: config.baseUrl,
-    cwd: config.cwd,
-    permissionMode: config.permissionMode,
-    ownerUserId: config.ownerUserId || '(未设置)',
-    token: config.token ? '***' : '(empty)',
-  });
-  writeRunInfoFn();
+    log.info('桥接服务启动', {
+      baseUrl: config.baseUrl,
+      cwd: config.cwd,
+      permissionMode: config.permissionMode,
+      ownerUserId: config.ownerUserId || '(未设置)',
+      token: config.token ? '***' : '(empty)',
+    });
+    writeRunInfoFn();
+  } catch (err) {
+    process.off('SIGINT', onEarlySignal);
+    process.off('SIGTERM', onEarlySignal);
+    releaseLocks();
+    throw err;
+  }
 
   /** 主循环 */
   const runLoop = async (): Promise<void> => {
@@ -1093,9 +1268,11 @@ export async function runService(
           saveState(runtime.getState());
         }
         for (const msg of resp.msgs ?? []) {
+          if (!running) break;
           await runtime.handleInbound(msg);
         }
       } catch (err) {
+        if (!running) break;
         log.error('轮询异常，退避重试', { error: String(err), backoff });
         await new Promise((r) => setTimeout(r, backoff));
         backoff = Math.min(backoff * 2, 10_000);
@@ -1114,35 +1291,66 @@ export async function runService(
     if (signalCount > 1) {
       log.warn('再次收到停止信号，立即退出');
       saveState(runtime.getState());
+      releaseLocks();
       process.exit(130);
     }
     log.info('收到停止信号，准备退出');
+    stopping = true;
     running = false;
     runtime.cancelAllTasks();
     abortController.abort();
     saveState(runtime.getState());
+    // 锁由 runLoop 收尾：先排空在途任务再释放，避免释放后仍回写 state.json
   };
   /** 移除信号监听，避免同进程多次启动时累积 */
   const removeSignals = (): void => {
+    process.off('SIGINT', onEarlySignal);
+    process.off('SIGTERM', onEarlySignal);
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
   };
+  removeSignals();
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
 
-  void runLoop()
+  /** 收尾：排空在途任务；超时则保留锁，并在任务落定后补释放 */
+  const shutdown = async (): Promise<void> => {
+    const drained = await drain();
+    if (!drained) {
+      log.error('排空超时，保留实例锁交由下一次启动接管', {
+        selfPid: process.pid,
+        stateDir: stateDir(),
+      });
+      // 补释放只写锁、不写状态：canPersist 以 lockReleased 为闸，释放后写入自动止步
+      idlePromise
+        ?.then(() => {
+          log.info('在途任务已落定，补释放实例锁', { selfPid: process.pid });
+          clearRunInfoFn(process.pid);
+          releaseLocks();
+        })
+        .catch((err) => log.warn('补释放实例锁失败', { error: String(err) }));
+      return;
+    }
+    clearRunInfoFn(process.pid);
+    releaseLocks();
+  };
+
+  const loopDone = runLoop()
     .catch((err) => log.error('主循环异常退出', { error: String(err) }))
-    .finally(() => {
+    .finally(async () => {
       removeSignals();
-      clearRunInfoFn(process.pid);
+      await shutdown();
     });
 
   return {
-    stop: (): void => {
+    stop: async (): Promise<void> => {
+      stopping = true;
       running = false;
       runtime.cancelAllTasks();
       abortController.abort();
       removeSignals();
+      // 等主循环收敛：finally 负责排空并释放锁，未启动的排队任务由 processTask 入口门禁丢弃
+      await loopDone;
     },
     config: runtime.getConfig(),
   };

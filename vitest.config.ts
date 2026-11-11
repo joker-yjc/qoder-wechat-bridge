@@ -23,6 +23,7 @@ export default defineConfig({
         'src/bridge/qoder.ts',
         'src/bridge/preflight.ts',
         'src/bridge/lifecycle.ts',
+        'src/bridge/instance-lock.ts',
         'src/bridge/service.ts',
         'src/weixin/client.ts',
         'src/weixin/errors.ts',

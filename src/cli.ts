@@ -6,9 +6,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { configPath, loadConfig, loadState, migrateLegacyConfig, statePath, type Config } from './config.js';
+import { configPath, loadConfig, loadState, migrateLegacyConfig, readRunInfo, statePath, type Config } from './config.js';
 import { runService } from './bridge/service.js';
-import { formatStopOutcome, stopExitCode, stopService } from './bridge/lifecycle.js';
+import { formatStopOutcome, describeOwner, isAlive, stopExitCode, stopService } from './bridge/lifecycle.js';
+import { AlreadyRunningError, LockIoError } from './bridge/instance-lock.js';
 import { login } from './weixin/login.js';
 import { notify } from './notify.js';
 import { sendMediaFile, sendVoiceFromText } from './weixin/send-media.js';
@@ -154,12 +155,15 @@ function printStatus(): void {
     }
   })();
   const usage = inboxUsage(config.inboxDir);
+  const runInfo = readRunInfo();
   const lines = buildStatusLines(config, state, {
     configFile: configPath(),
     stateFile: statePath(),
     personaInfo,
     inbox: usage,
     home: os.homedir(),
+    runInfo,
+    runAlive: runInfo ? isAlive(runInfo.pid) : false,
   });
   console.log(lines.join('\n'));
 }
@@ -307,8 +311,23 @@ async function main(): Promise<void> {
   }
 
   if (command === 'run') {
-    const handle = await runService(overridesFromFlags(flags));
-    log.info('服务已启动', { cwd: handle.config.cwd, mode: handle.config.permissionMode });
+    try {
+      const handle = await runService(overridesFromFlags(flags));
+      log.info('服务已启动', { cwd: handle.config.cwd, mode: handle.config.permissionMode });
+    } catch (err) {
+      if (err instanceof AlreadyRunningError) {
+        console.error(describeOwner(err.owner, err.launchdLabelValue));
+        if (err.lockFile) {
+          console.error(`如确认没有实例在运行，可删除记录文件后重试：\n  rm "${err.lockFile}"`);
+        }
+        process.exit(1);
+      }
+      if (err instanceof LockIoError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     return;
   }
 
