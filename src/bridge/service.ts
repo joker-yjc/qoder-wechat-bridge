@@ -20,8 +20,10 @@ import {
 } from '../config.js';
 import os from 'node:os';
 import { log } from '../log.js';
-import { listModels, resolveModel, formatModelList } from '../models.js';
-import { formatHelp, isUnknownCommand } from '../commands.js';
+import { listModels } from '../models.js';
+import { dispatchCommand, findHandler, isUnknownCommand, type CommandContext } from '../commands.js';
+import type { PendingDelete } from './commands/types.js';
+import { listSessions, renameSession, deleteSession, type SessionEntry } from './sessions.js';
 import { login } from '../weixin/login.js';
 import {
   extractText,
@@ -71,6 +73,9 @@ export interface ServiceDeps {
   takePending?: typeof takePending;
   loadPersona?: typeof loadPersona;
   listModels?: typeof listModels;
+  listSessions?: typeof listSessions;
+  renameSession?: typeof renameSession;
+  deleteSession?: typeof deleteSession;
   getTypingTicket?: typeof getTypingTicket;
   sendTyping?: typeof sendTyping;
   downloadItemMedia?: typeof downloadItemMedia;
@@ -210,6 +215,9 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
   const takePendingFn = deps.takePending ?? takePending;
   const loadPersonaFn = deps.loadPersona ?? loadPersona;
   const listModelsFn = deps.listModels ?? listModels;
+  const listSessionsFn = deps.listSessions ?? listSessions;
+  const renameSessionFn = deps.renameSession ?? renameSession;
+  const deleteSessionFn = deps.deleteSession ?? deleteSession;
   const getTypingTicketFn = deps.getTypingTicket ?? getTypingTicket;
   const sendTypingFn = deps.sendTyping ?? sendTyping;
   const downloadMediaFn = deps.downloadItemMedia ?? downloadItemMedia;
@@ -222,6 +230,12 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
   const queues = new Map<string, Promise<void>>();
   /** 每个用户当前正在执行的任务句柄，用于 /stop 强制停止 */
   const runningTasks = new Map<string, { cancel: () => void; cancelled: boolean }>();
+  /** 每用户最近一次 /sessions 清单缓存，供 /switch <序号> 解析（内存态，重启失效） */
+  const sessionCatalogs = new Map<string, SessionEntry[]>();
+  /** 每用户 /new 记录的待用显示名，创建会话时经 -n 消费（内存态，重启失效） */
+  const pendingNames = new Map<string, string>();
+  /** 每用户 /delete 第一步留下的待确认删除（内存态，60s 过期） */
+  const pendingDeletes = new Map<string, PendingDelete>();
 
   /**
    * 当前队列策略
@@ -496,69 +510,31 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
       if (flushed.stopReason === 'quota') session.quotaExhausted = true;
       if (flushed.stopReason === 'session_expired') session.sessionExpired = true;
 
-      // 内置命令
+      // 内置命令：统一注册表分发（处理器见 bridge/commands/）
       const command = text.trim();
-      if (command === '/help') {
-        await session.sendSingle(formatHelp(), { kind: 'notice', queueOnFailure: true });
-        return;
-      }
-      if (command === '/reset') {
-        delete state.sessions[userId];
-        persistState();
-        await session.sendSingle('会话已重置，下一条消息将开启新的 Qoder 会话。', {
-          kind: 'notice',
-          queueOnFailure: true,
-        });
-        return;
-      }
-      if (command === '/status') {
-        const record = state.sessions[userId];
-        const lines = [
-          `工作目录：${workdir()}${config.cwd.trim() ? '' : '（全局）'}`,
-          `模型：${state.models[userId] ?? config.qoderModel ?? 'Auto（默认）'}`,
-          `Qoder 会话：${record ? record.sessionId : '（尚未创建）'}`,
-          `累计轮次：${record?.turns ?? 0}`,
-          `待补发：${state.outbox.filter((item) => item.toUserId === userId).length} 条`,
-          `隔离区：${state.quarantine.length} 条`,
-          `下行额度：${state.quota.streak > 0 ? `连续 ${state.quota.streak} 个窗口耗尽` : '正常'}`,
-        ];
-        await session.sendSingle(lines.join('\n'), { kind: 'notice', queueOnFailure: true });
-        return;
-      }
-
-      // 模型切换
-      const modelMatch = /^\/model(?:\s+([\s\S]*))?$/.exec(command);
-      if (modelMatch) {
-        const arg = (modelMatch[1] ?? '').trim();
-        if (!arg) {
-          const catalog = listModelsFn(config.qoderBin);
-          await session.sendSingle(formatModelList(catalog, state.models[userId] ?? config.qoderModel), {
-            kind: 'notice',
-            queueOnFailure: true,
-          });
-          return;
-        }
-        if (['default', 'auto', '默认'].includes(arg.toLowerCase())) {
-          delete state.models[userId];
-          persistState();
-          await session.sendSingle('已恢复默认模型（Auto）。', { kind: 'notice', queueOnFailure: true });
-          return;
-        }
-        const catalog = listModelsFn(config.qoderBin);
-        const resolved = resolveModel(arg, catalog);
-        if (!resolved.ok) {
-          await session.sendSingle(`未找到模型：${arg}\n发送 /model 查看可用列表。`, {
-            kind: 'notice',
-            queueOnFailure: true,
-          });
-          return;
-        }
-        state.models[userId] = resolved.option.id;
-        persistState();
-        await session.sendSingle(`已切换模型：${resolved.option.label}\n下一条任务起生效。`, {
-          kind: 'notice',
-          queueOnFailure: true,
-        });
+      const commandCtx: CommandContext = {
+        userId,
+        contextToken,
+        state,
+        config,
+        reply: async (replyText) => {
+          await session.sendSingle(replyText, { kind: 'notice', queueOnFailure: true });
+        },
+        workdir,
+        persistState,
+        catalogs: sessionCatalogs,
+        pendingNames,
+        pendingDeletes,
+        isTaskRunning: (id) => runningTasks.has(id),
+        deps: { listSessions: listSessionsFn, renameSession: renameSessionFn, deleteSession: deleteSessionFn, listModels: listModelsFn },
+        log,
+      };
+      try {
+        if (await dispatchCommand(commandCtx, command)) return;
+      } catch (err) {
+        // 处理器内部 catch 负责命令级语义；此处兜底未捕获异常，保证用户收到可读回复（需求 6.3）
+        log.warn('命令处理异常', { userId, command, error: String(err) });
+        await session.sendSingle('命令执行出错，请稍后重试。', { kind: 'notice', queueOnFailure: true });
         return;
       }
 
@@ -601,6 +577,7 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
         prompt: text,
         cwd: config.cwd.trim() ? config.cwd : undefined,
         sessionId: record?.sessionId,
+        name: !record?.sessionId ? pendingNames.get(userId) : undefined,
         timeoutMs: config.qoderTimeoutMs,
         bin: config.qoderBin,
         permissionMode: config.permissionMode,
@@ -635,6 +612,7 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
         result = await runQoderFn({
           prompt: text,
           cwd: config.cwd.trim() ? config.cwd : undefined,
+          name: pendingNames.get(userId),
           timeoutMs: config.qoderTimeoutMs,
           bin: config.qoderBin,
           permissionMode: config.permissionMode,
@@ -658,6 +636,8 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
           turns: (record?.turns ?? 0) + 1,
         };
         persistState();
+        // 创建成功后消费待用名，避免后续续接误带 -n
+        pendingNames.delete(userId);
       }
 
       if (!result.ok) {
@@ -891,6 +871,15 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
         log.info('收到停止指令，正在终止任务', { from });
       } else if (stopToken) {
         await sendControl(from, stopToken, '当前没有正在执行的任务。');
+      }
+      return;
+    }
+
+    // 变更类会话命令在任务运行中拒绝；守卫由处理器 requiresIdle 元数据驱动，新增命令零改 intake
+    const sessionHandler = findHandler(commandText);
+    if (sessionHandler?.requiresIdle && runningTasks.has(from)) {
+      if (contextToken) {
+        await sendControl(from, contextToken, '任务执行中，请先 /stop 再管理会话。');
       }
       return;
     }

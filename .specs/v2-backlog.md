@@ -5,7 +5,7 @@ v0.1 刻意砍掉的东西。每条都标了为什么当时不做、以及做之
 > 2026-11-10 清理：删除出站图片/文件/视频、取消任务等已由既有代码支持的条目；额度精确记账与补发去重受 iLink 契约限制（`sendmessage` 无送达回执、`getconfig` 无额度字段），不再作为待办跟踪；流式输出与工具调用进度气泡保留在「明确不做」并附实测结论；多实例互斥已完成并指向规范目录。
 
 
-## 双向决策（v0.3）
+## 双向决策
 
 `notify` 是单向的：发出去就不管了。真正需要"等你回一句再继续"时，要解决单消费者问题：
 
@@ -16,7 +16,7 @@ v0.1 刻意砍掉的东西。每条都标了为什么当时不做、以及做之
 
 ## 会话与路由
 
-- **多会话切换**：按 `/new`、`/use <name>` 管理多个 Qoder 会话。
+- **多会话切换**：✅ 2026-11-14 已完成，见 `.specs/20261114_微信会话管理/`（`/sessions` `/switch` `/new` `/rename` + 命令处理器注册表）。`/use <name>` 由 `/switch <名称>` 覆盖。
 - **按项目路由**：消息前缀或关键词指定 `cwd`，替代固定目录。
 
 ## 可靠性
@@ -26,6 +26,8 @@ v0.1 刻意砍掉的东西。每条都标了为什么当时不做、以及做之
 ## 工程
 
 - **CI**：GitHub Actions 跑 typecheck + build + pack 自检。
+- **spawn 类用例 timing flaky 治理**（2026-11-14 审查登记）：`qoder.test.ts` / `fake-ilink` / `instance-lock` 在默认 28 worker 并行 + 覆盖率插桩抢占 CPU 时偶发假超时；安静环境 `--maxWorkers=2` 全绿。建议放宽这些用例超时或降低默认并发；另 qoder 测试未隔离 `QWB_STATE_DIR`，会把夹具 parse 错误写进生产日志目录（测试卫生），建议测试隔离状态目录。
+- **会话管理延期 Minor**（2026-11-14，见 `.specs/20261114_微信会话管理/review.md` §9）：Minor-2 rename 成功回读清单验证、Minor-3 /rename 纳入 runningTasks 可取消（涉验收与安全，下一迭代优先）；Minor-6 /switch 复制 turns 语义、Minor-12 intake 与分发大小写口径、Minor-13 CommandContext 死字段、Minor-15 commands↔help 循环导入下移 formatHelp。
 
 ## 明确不做
 

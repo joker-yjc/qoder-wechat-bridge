@@ -90,9 +90,19 @@ node dist/cli.js run --inbox-dir ~/qwb-inbox  # 自定义附件目录
 node dist/cli.js run --permission-mode dont_ask
 ```
 
-微信内置命令：`/help`（命令总览）、`/status`、`/reset`、`/stop`（停止当前任务）、`/model`（列出模型）、`/model <序号|名称>`（切换）、`/model default`（恢复 Auto）。
+微信内置命令：`/help`（命令总览）、`/status`、`/reset`、`/stop`（停止当前任务）、`/model`（列出模型）、`/model <序号|名称>`（切换）、`/model default`（恢复 Auto）、`/sessions`（列会话）、`/switch <序号|id|名称>`（切换会话）、`/new [名称]`（开新会话）、`/rename <名称>`（重命名当前会话）、`/delete <序号|id|名称>`（删除会话，需 `/delete yes <序号>` 确认）。
 
 > 自定义 provider 的模型必须写成 `<providerId>/<model>`（如 `qoder-custom-xxxx/glm-5.3`），只写短名会被 Qoder 静默回落到 `auto`；`/model` 内部已做这层映射。
+
+### 4.1 会话管理
+
+- 会话生在 Qoder CLI 侧（`~/.qoder/projects/<工作目录slug>/<session>.jsonl`），按工作目录隔离；桌面 GUI 不索引 CLI 会话。
+- `/sessions` 只读，列出当前工作目录会话并标 `← 当前`，默认最多 10 条（`sessionListLimit` / `QWB_SESSION_LIST_LIMIT` 可配）。
+- `/switch`、`/new` 只改桥接指针（`state.json` 的 `sessions[userId]`），不触碰任何会话内容；旧会话可经 `/sessions` + `/switch` 找回。
+- `/new [名称]` 不立即调 CLI、不耗额度；名称在下一条真实消息创建会话时经 `-n` 生效。
+- `/rename` 走受支持路径 `-r <id> -n <新名> -p`，会跑一个完整模型轮次（约 0.05 积分 + 会话历史多一条轮次）；这是 CLI 无独立 rename 旗标的固有代价。
+- `/switch`、`/new`、`/rename`、`/delete` 在该用户有任务执行时被 intake 拒绝并提示先 `/stop`；`/sessions` 只读放行。
+- `/delete <目标>` 两步确认：先回复将删除的会话名与 id，再发 `/delete yes <序号>`（60 秒内）才真删；调 `qodercli --delete-session <序号>`，删活动会话会同时清指针。不可恢复。
 
 ## 5. 排错
 

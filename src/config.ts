@@ -156,6 +156,8 @@ export interface Config {
   diagnosticRetentionDays: number;
   /** qodercli --version 预检超时 */
   preflightVersionTimeoutMs: number;
+  /** /sessions 清单最多展示条数（控制下行额度） */
+  sessionListLimit: number;
 }
 
 /** 默认配置：面向通用场景，安全优先 */
@@ -190,6 +192,7 @@ export const DEFAULT_CONFIG: Config = {
   diagnosticMaxBytes: 64 * 1024,
   diagnosticRetentionDays: 7,
   preflightVersionTimeoutMs: 5_000,
+  sessionListLimit: 10,
 };
 
 /** 环境变量覆盖表 */
@@ -230,6 +233,15 @@ const ENV_OVERRIDES: ReadonlyArray<[keyof Config, string, (raw: string) => unkno
   ['diagnosticMaxBytes', 'QWB_DIAG_MAX_BYTES', (v) => Number(v)],
   ['diagnosticRetentionDays', 'QWB_DIAG_RETENTION_DAYS', (v) => Number(v)],
   ['preflightVersionTimeoutMs', 'QWB_PREFLIGHT_VERSION_TIMEOUT_MS', (v) => Number(v)],
+  [
+    'sessionListLimit',
+    'QWB_SESSION_LIST_LIMIT',
+    // 非法值回落默认：清单上限必须为正整数，否则截断逻辑失效
+    (v) => {
+      const parsed = Number(v);
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_CONFIG.sessionListLimit;
+    },
+  ],
 ];
 
 /** 某个微信用户对应的 Qoder 会话 */
@@ -369,6 +381,10 @@ export function loadConfig(): Config {
   const dedupWindow = Number(merged.errorDedupWindowMs);
   merged.errorDedupWindowMs =
     Number.isFinite(dedupWindow) && dedupWindow > 0 ? dedupWindow : DEFAULT_CONFIG.errorDedupWindowMs;
+  // 配置文件可能手写 0/负数/非数字，清单上限须为正整数，否则截断逻辑失效（Minor-9）
+  const listLimit = Number(merged.sessionListLimit);
+  merged.sessionListLimit =
+    Number.isInteger(listLimit) && listLimit > 0 ? listLimit : DEFAULT_CONFIG.sessionListLimit;
   for (const [key, envName, parse] of ENV_OVERRIDES) {
     const raw = process.env[envName];
     if (raw === undefined || raw === '') continue;

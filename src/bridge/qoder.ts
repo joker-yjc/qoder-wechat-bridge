@@ -16,6 +16,8 @@ export interface QoderRunInput {
   cwd?: string;
   /** 已有会话 id，传入则用 -r 续接 */
   sessionId?: string;
+  /** 创建会话时的显示名，传入则用 -n 命名（仅在新建时由调用方提供） */
+  name?: string;
   timeoutMs: number;
   bin: string;
   permissionMode: string;
@@ -192,6 +194,7 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
   if (input.cwd?.trim()) args.push('-w', input.cwd.trim());
   if (input.model) args.push('-m', input.model);
   if (input.sessionId) args.push('-r', input.sessionId);
+  if (input.name?.trim()) args.push('-n', input.name.trim());
   for (const file of input.attachments ?? []) {
     args.push('--attachment', file);
   }
