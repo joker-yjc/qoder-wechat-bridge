@@ -21,6 +21,7 @@ export default defineConfig({
         'src/bridge/error-class.ts',
         'src/bridge/error-dedup.ts',
         'src/bridge/failure.ts',
+        'src/bridge/backend.ts',
         'src/bridge/qoder.ts',
         'src/bridge/preflight.ts',
         'src/bridge/lifecycle.ts',

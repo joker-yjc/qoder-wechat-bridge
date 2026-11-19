@@ -277,7 +277,7 @@ describe('renameSession', () => {
     vi.mocked(spawn).mockReturnValue(fake.child as never);
     const promise = renameSession(input);
     fake.emit('error', new Error('ENOENT'));
-    await expect(promise).resolves.toEqual({ ok: false, error: '无法启动 qodercli' });
+    await expect(promise).resolves.toEqual({ ok: false, error: '无法启动 Qoder CLI' });
   });
 
   it('应该在输出无法解析时返回失败', async () => {
@@ -334,7 +334,7 @@ describe('deleteSession', () => {
     vi.mocked(spawn).mockReturnValue(fake.child as never);
     const promise = deleteSession(input);
     fake.emit('error', new Error('ENOENT'));
-    await expect(promise).resolves.toEqual({ ok: false, error: '无法启动 qodercli' });
+    await expect(promise).resolves.toEqual({ ok: false, error: '无法启动 Qoder CLI' });
   });
 
   it('应该在超时时 kill 并返回失败', async () => {

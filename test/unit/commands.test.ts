@@ -123,8 +123,18 @@ describe('既有命令处理器', () => {
     ctx.state.sessions.u1 = { sessionId: 's1', updatedAt: 1, turns: 3 };
     expect(await dispatchCommand(ctx, '/status')).toBe(true);
     expect(replies[0]).toContain('工作目录：/work');
+    expect(replies[0]).toContain('后端：qodercli');
     expect(replies[0]).toContain('Qoder 会话：s1');
     expect(replies[0]).toContain('累计轮次：3');
+  });
+
+  it('/status 跨后端旧指针应该显示尚未创建并展示当前后端', async () => {
+    const { ctx, replies } = makeCtx({ config: { ...DEFAULT_CONFIG, qoderBin: 'qoderclicn' } });
+    ctx.state.sessions.u1 = { sessionId: 's1', updatedAt: 1, turns: 3, bin: 'qodercli' };
+    expect(await dispatchCommand(ctx, '/status')).toBe(true);
+    expect(replies[0]).toContain('后端：qoderclicn');
+    expect(replies[0]).toContain('Qoder 会话：（尚未创建）');
+    expect(replies[0]).toContain('累计轮次：0');
   });
 
   it('/model 无参应该列模型', async () => {

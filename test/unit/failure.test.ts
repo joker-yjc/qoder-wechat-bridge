@@ -32,7 +32,7 @@ describe('buildUserErrorReply', () => {
       exitCode: 1,
       maxChars: 300,
     });
-    expect(text).toContain('无法启动 qodercli');
+    expect(text).toContain('无法启动 Qoder CLI');
     expect(text).toContain('ENOENT: not found');
     expect(text).not.toContain('at spawn');
   });
@@ -65,7 +65,7 @@ describe('buildUserErrorReply', () => {
 
   it('应该在 is_error 无详情时使用通用文案', () => {
     const text = buildUserErrorReply({ kind: 'is_error', exitCode: 1, maxChars: 300 });
-    expect(text).toContain('qodercli 返回错误');
+    expect(text).toContain('Qoder CLI 返回错误');
     expect(text).toContain('详见本机日志');
   });
 
@@ -103,7 +103,7 @@ describe('buildUserErrorReply 语义类别', () => {
 
   it('应该在凭据失效时说明需在本机重新登录', () => {
     const text = buildUserErrorReply({ kind: 'exit', errorClass: 'auth', exitCode: 1, maxChars: 300 });
-    expect(text).toBe('Qoder 凭据已失效：需在本机重新登录 qodercli 后重试。（退出码 1）');
+    expect(text).toBe('Qoder 凭据已失效：需在本机重新登录 Qoder CLI 后重试。（退出码 1）');
   });
 
   it('应该让三个语义模板完全不含英文原文，即使 detail 传了原文', () => {
@@ -125,11 +125,11 @@ describe('buildUserErrorReply 语义类别', () => {
       { input: { kind: 'timeout', timeoutMs: 120_000 }, expected: '执行失败：任务超过 120 秒被终止。详见本机日志。' },
       {
         input: { kind: 'spawn', detail: 'ENOENT: not found' },
-        expected: '执行失败：无法启动 qodercli（ENOENT: not found）。请检查 QWB_QODER_BIN，详见本机日志。',
+        expected: '执行失败：无法启动 Qoder CLI（ENOENT: not found）。请检查 QWB_QODER_BIN，详见本机日志。',
       },
-      { input: { kind: 'empty', exitCode: 1 }, expected: '执行失败：qodercli 没有任何输出（退出码 1）。详见本机日志。' },
-      { input: { kind: 'parse', exitCode: 2 }, expected: '执行失败：qodercli 输出无法解析（退出码 2）。详见本机日志。' },
-      { input: { kind: 'exit', exitCode: 1 }, expected: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。' },
+      { input: { kind: 'empty', exitCode: 1 }, expected: '执行失败：Qoder CLI 没有任何输出（退出码 1）。详见本机日志。' },
+      { input: { kind: 'parse', exitCode: 2 }, expected: '执行失败：Qoder CLI 输出无法解析（退出码 2）。详见本机日志。' },
+      { input: { kind: 'exit', exitCode: 1 }, expected: '执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。' },
       {
         input: { kind: 'is_error', detail: '第一行错误', exitCode: 1 },
         expected: '执行失败：第一行错误（退出码 1）',

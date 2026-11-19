@@ -3,7 +3,9 @@
  * @module bridge/service
  */
 import {
+  activeSession,
   clearRunInfo,
+  DEFAULT_CONFIG,
   ensureDirs,
   loadConfig,
   loadState,
@@ -24,6 +26,7 @@ import { listModels } from '../models.js';
 import { dispatchCommand, findHandler, isUnknownCommand, type CommandContext } from '../commands.js';
 import type { PendingDelete } from './commands/types.js';
 import { listSessions, renameSession, deleteSession, type SessionEntry } from './sessions.js';
+import { backendProfile, resolveConfigDir } from './backend.js';
 import { login } from '../weixin/login.js';
 import {
   extractText,
@@ -548,7 +551,16 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
       }
 
       // 调 Qoder
-      const record = state.sessions[userId];
+      const rawRecord = state.sessions[userId];
+      const record = activeSession(state, userId, config.qoderBin);
+      if (rawRecord && !record) {
+        log.info('后端已切换，旧会话指针不可续接，将新建会话', {
+          userId,
+          taskId: id,
+          oldBin: rawRecord.bin ?? DEFAULT_CONFIG.qoderBin,
+          newBin: config.qoderBin,
+        });
+      }
       const modelForTask = state.models[userId] ?? config.qoderModel;
       const persona = loadPersonaFn(config.personaFile);
       const nextSnapshot = nodeFingerprintFn();
@@ -634,6 +646,7 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
           sessionId: result.sessionId,
           updatedAt: Date.now(),
           turns: (record?.turns ?? 0) + 1,
+          bin: config.qoderBin,
         };
         persistState();
         // 创建成功后消费待用名，避免后续续接误带 -n
@@ -981,11 +994,12 @@ export function createBridgeRuntime(initialConfig: Config, state: State, deps: S
 /**
  * 生成预检失败告警
  * @param result - 预检结果
+ * @param qoderBin - 当前配置的后端 bin，告警提示用户检查该 CLI
  * @returns 单条短告警
  */
-export function formatPreflightAlert(result: PreflightResult): string {
+export function formatPreflightAlert(result: PreflightResult, qoderBin: string): string {
   const kinds = result.failures.map((failure) => failure.kind).join(', ') || 'unknown';
-  return `本机 Qoder 环境异常：${kinds}。已记录日志，请检查 Node / qodercli。`.slice(0, 300);
+  return `本机 Qoder 环境异常：${kinds}。已记录日志，请检查 Node / ${qoderBin}。`.slice(0, 300);
 }
 
 /**
@@ -1181,6 +1195,8 @@ export async function runService(
     } else {
       log.error('启动预检失败', {
         failures: preflight.failures.map((failure) => failure.kind),
+        details: preflight.failures.map((failure) => failure.detail).join('; ').slice(0, 300),
+        qoderBin: config.qoderBin,
         nodeVersion: preflight.node.version,
         nodePath: preflight.node.execPath,
         qoderPath: preflight.qodercli?.path ?? '',
@@ -1193,7 +1209,7 @@ export async function runService(
             baseUrl: runtime.getConfig().baseUrl,
             token: runtime.getConfig().token,
             toUserId: owner,
-            text: formatPreflightAlert(preflight),
+            text: formatPreflightAlert(preflight, config.qoderBin),
             contextToken: token,
           });
         } catch (err) {
@@ -1208,6 +1224,10 @@ export async function runService(
       permissionMode: config.permissionMode,
       ownerUserId: config.ownerUserId || '(未设置)',
       token: config.token ? '***' : '(empty)',
+      qoderBin: config.qoderBin,
+      backend: backendProfile(config.qoderBin).kind,
+      memoryEnv: backendProfile(config.qoderBin).memoryEnv,
+      configDir: resolveConfigDir(config.qoderBin),
     });
     writeRunInfoFn();
   } catch (err) {

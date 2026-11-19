@@ -6,6 +6,7 @@ import spawn from 'cross-spawn';
 import os from 'node:os';
 import { log } from '../log.js';
 import { writeDiagnostic } from '../diagnostics.js';
+import { backendProfile, resolveConfigDir } from './backend.js';
 import { buildUserErrorReply, type QoderErrorKind } from './failure.js';
 import { classifyQoderError, type QoderErrorClass, type QoderSemanticFields } from './error-class.js';
 
@@ -89,19 +90,29 @@ const DEFAULT_ERROR_MAX_CHARS = 300;
 
 /**
  * 构造干净的环境变量
- * 关键：从 Qoder Desktop 的 shell 启动时，继承的 QODER_* 会让 qodercli 误判为 SDK worker
- * 记忆开关 QODER_MEMORY_HEADLESS 是唯一需要补回来的一个
- * @param opts - memory=true 时打开 headless 长期记忆
+ * 关键：从 Qoder Desktop 的 shell 启动时，继承的 QODER_* / QODERCN_* 会让 CLI 误判为 SDK worker
+ * 记忆开关按后端画像设置：国际版 QODER_MEMORY_HEADLESS，CN 版 QODERCN_MEMORY_HEADLESS（CN 包 yo() 前缀实测）
+ * 配置目录覆盖按后端补回：只补当前后端的变量（CN QODERCN_CONFIG_DIR / intl QODER_CONFIG_DIR），
+ * 保证 CLI 子进程与 models.ts 读到同一目录，且不泄漏另一后端的覆盖
+ * @param opts - memory=true 时打开 headless 长期记忆；bin 用于推导后端（缺省国际版）
  * @returns 清理后的环境变量
  */
-export function cleanEnv(opts: { memory?: boolean } = {}): NodeJS.ProcessEnv {
+export function cleanEnv(opts: { memory?: boolean; bin?: string } = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {
-    if (key.startsWith('QODER_') || key === 'CLAUDECODE' || key.startsWith('CLAUDE_CODE_')) {
+    if (
+      key.startsWith('QODER_') ||
+      key.startsWith('QODERCN_') ||
+      key === 'CLAUDECODE' ||
+      key.startsWith('CLAUDE_CODE_')
+    ) {
       delete env[key];
     }
   }
-  if (opts.memory) env.QODER_MEMORY_HEADLESS = '1';
+  const bin = opts.bin ?? 'qodercli';
+  const profile = backendProfile(bin);
+  if (opts.memory) env[profile.memoryEnv] = '1';
+  env[profile.configDirEnv] = resolveConfigDir(bin);
   return env;
 }
 
@@ -203,7 +214,7 @@ export function runQoder(input: QoderRunInput): Promise<QoderRunResult> {
   return new Promise((resolve) => {
     const child = spawn(input.bin, args, {
       cwd: workdir,
-      env: cleanEnv({ memory: input.memory }),
+      env: cleanEnv({ memory: input.memory, bin: input.bin }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     input.onStart?.(() => {

@@ -4,6 +4,7 @@
  */
 import { SessionError, resolveSession } from '../sessions.js';
 import type { CommandHandler } from './types.js';
+import { activeSession } from '../../config.js';
 
 /** /switch 命令处理器（变更类，要求空闲） */
 export const switchCommand: CommandHandler = {
@@ -12,7 +13,7 @@ export const switchCommand: CommandHandler = {
   requiresIdle: true,
   handle: async (ctx, text) => {
     const arg = text.trim().slice('/switch'.length).trim();
-    const current = ctx.state.sessions[ctx.userId];
+    const current = activeSession(ctx.state, ctx.userId, ctx.config.qoderBin);
     if (!arg) {
       await ctx.reply(
         `用法：/switch <序号|id|名称>\n当前会话：${current ? current.sessionId : '（尚未创建）'}\n发 /sessions 查看清单。`,
@@ -45,6 +46,7 @@ export const switchCommand: CommandHandler = {
         sessionId: entry.sessionId,
         updatedAt: Date.now(),
         turns: current?.turns ?? 0,
+        bin: ctx.config.qoderBin,
       };
       ctx.persistState();
       // 切换后不再创建新会话，清掉 /new 留下的待用名，避免意外命名（Minor-5）

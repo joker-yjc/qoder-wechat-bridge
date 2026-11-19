@@ -315,7 +315,7 @@ describe('错误可读性集成测试', () => {
     handle.stop();
     await sleep();
 
-    expect(fake.sent[0]?.text).toBe('Qoder 凭据已失效：需在本机重新登录 qodercli 后重试。（退出码 1）');
+    expect(fake.sent[0]?.text).toBe('Qoder 凭据已失效：需在本机重新登录 Qoder CLI 后重试。（退出码 1）');
     expect(fake.sent[0]?.text).not.toContain('authentication_failed');
   });
 
@@ -329,7 +329,7 @@ describe('错误可读性集成测试', () => {
     handle.stop();
     await sleep();
 
-    expect(fake.sent[0]?.text).toBe('执行失败：qodercli 异常退出（退出码 1）。详见本机日志。');
+    expect(fake.sent[0]?.text).toBe('执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。');
     expect(fake.sent[0]?.text).not.toContain('Rate limit');
     expect(loadState().lastFailure).toMatchObject({ errorClass: 'unknown', errorCode: 'rate_limit' });
   });
@@ -411,7 +411,7 @@ describe('错误可读性集成测试', () => {
     // 重试次数由 test/unit/service.test.ts 的「应该在会话续接失败时用新会话重试」断言，
     // 这里只验集成链路上的可观测结果：英文原文不直达用户
     expect(fake.sent[0]?.text).not.toContain('resume not found');
-    expect(fake.sent[0]?.text).toBe('执行失败：qodercli 异常退出（退出码 1）。详见本机日志。');
+    expect(fake.sent[0]?.text).toBe('执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。');
   });
 
   it('应该在 status 里分行展示最近失败与下行额度', async () => {

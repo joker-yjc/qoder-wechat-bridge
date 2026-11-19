@@ -131,6 +131,32 @@ switch (mode) {
     });
     process.exitCode = 1;
     break;
+  // 把子进程实际收到的记忆开关与残留前缀键写进 result，供 cleanEnv 按后端断言
+  case 'env-probe': {
+    const intentional = new Set([
+      'QODER_MEMORY_HEADLESS',
+      'QODERCN_MEMORY_HEADLESS',
+      'QODER_CONFIG_DIR',
+      'QODERCN_CONFIG_DIR',
+    ]);
+    const others = Object.keys(process.env).filter(
+      (k) => (k.startsWith('QODER_') || k.startsWith('QODERCN_')) && !intentional.has(k),
+    );
+    ok({
+      type: 'result',
+      result: JSON.stringify({
+        intl: process.env.QODER_MEMORY_HEADLESS ?? null,
+        cn: process.env.QODERCN_MEMORY_HEADLESS ?? null,
+        intlCfg: process.env.QODER_CONFIG_DIR ?? null,
+        cnCfg: process.env.QODERCN_CONFIG_DIR ?? null,
+        others,
+      }),
+      session_id: 's-env',
+      modelUsage: { m: 1 },
+    });
+    process.exitCode = 0;
+    break;
+  }
   default:
     process.exitCode = 2;
 }

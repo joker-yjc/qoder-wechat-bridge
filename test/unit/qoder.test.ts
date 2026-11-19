@@ -18,6 +18,8 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.FAKE_QODER_MODE;
+  delete process.env.QODER_CONFIG_DIR;
+  delete process.env.QODERCN_CONFIG_DIR;
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -69,6 +71,102 @@ describe('cleanEnv', () => {
 
   it('应该在关闭记忆时不设置记忆开关', () => {
     expect(cleanEnv({ memory: false }).QODER_MEMORY_HEADLESS).toBeUndefined();
+  });
+
+  it('应该同时剥离 QODER_ 与 QODERCN_ 前缀', () => {
+    process.env.QODER_FOO = '1';
+    process.env.QODERCN_BAR = '1';
+    const env = cleanEnv();
+    expect(env.QODER_FOO).toBeUndefined();
+    expect(env.QODERCN_BAR).toBeUndefined();
+    delete process.env.QODER_FOO;
+    delete process.env.QODERCN_BAR;
+  });
+
+  it('CN 后端记忆开关用 QODERCN_MEMORY_HEADLESS 且互斥', () => {
+    const env = cleanEnv({ memory: true, bin: 'qoderclicn' });
+    expect(env.QODERCN_MEMORY_HEADLESS).toBe('1');
+    expect(env.QODER_MEMORY_HEADLESS).toBeUndefined();
+  });
+
+  it('国际版后端记忆开关用 QODER_MEMORY_HEADLESS 且互斥', () => {
+    const env = cleanEnv({ memory: true, bin: 'qodercli' });
+    expect(env.QODER_MEMORY_HEADLESS).toBe('1');
+    expect(env.QODERCN_MEMORY_HEADLESS).toBeUndefined();
+  });
+
+  it('bin 缺省按国际版设开关', () => {
+    const env = cleanEnv({ memory: true });
+    expect(env.QODER_MEMORY_HEADLESS).toBe('1');
+    expect(env.QODERCN_MEMORY_HEADLESS).toBeUndefined();
+  });
+
+  it('关闭记忆时两个后端开关都不设', () => {
+    const env = cleanEnv({ memory: false, bin: 'qoderclicn' });
+    expect(env.QODER_MEMORY_HEADLESS).toBeUndefined();
+    expect(env.QODERCN_MEMORY_HEADLESS).toBeUndefined();
+  });
+
+  it('CN 后端的配置目录覆盖补回子进程，国际版覆盖变量被剥', () => {
+    process.env.QODERCN_CONFIG_DIR = '/tmp/cn-cfg';
+    process.env.QODER_CONFIG_DIR = '/tmp/intl-cfg';
+    const env = cleanEnv({ bin: 'qoderclicn' });
+    expect(env.QODERCN_CONFIG_DIR).toBe('/tmp/cn-cfg');
+    expect(env.QODER_CONFIG_DIR).toBeUndefined();
+    delete process.env.QODERCN_CONFIG_DIR;
+    delete process.env.QODER_CONFIG_DIR;
+  });
+
+  it('intl 后端的配置目录覆盖补回子进程，CN 覆盖变量被剥', () => {
+    process.env.QODER_CONFIG_DIR = '/tmp/intl-cfg';
+    process.env.QODERCN_CONFIG_DIR = '/tmp/cn-cfg';
+    const env = cleanEnv({ bin: 'qodercli' });
+    expect(env.QODER_CONFIG_DIR).toBe('/tmp/intl-cfg');
+    expect(env.QODERCN_CONFIG_DIR).toBeUndefined();
+    delete process.env.QODER_CONFIG_DIR;
+    delete process.env.QODERCN_CONFIG_DIR;
+  });
+
+  it('无覆盖时按后端默认目录补回，保证与 models 读取一致', () => {
+    const env = cleanEnv({ bin: 'qoderclicn' });
+    expect(env.QODERCN_CONFIG_DIR).toBe(path.join(os.homedir(), '.qoder-cn'));
+    expect(env.QODER_CONFIG_DIR).toBeUndefined();
+  });
+});
+
+describe('runQoder 按后端传递记忆开关（env-probe 夹具）', () => {
+  /** 把夹具复制成指定 bin 名，使 backendProfile 能按名推导后端 */
+  function namedFixture(name: string): string {
+    const target = path.join(root, name);
+    fs.copyFileSync(fixture, target);
+    fs.chmodSync(target, 0o755);
+    return target;
+  }
+
+  it('CN bin 名子进程收到 QODERCN_MEMORY_HEADLESS 且无泄漏', async () => {
+    const result = await run('env-probe', { bin: namedFixture('qoderclicn'), memory: true });
+    expect(result.ok).toBe(true);
+    const probe = JSON.parse(result.text) as {
+      intl: string | null; cn: string | null; intlCfg: string | null; cnCfg: string | null; others: string[];
+    };
+    expect(probe.cn).toBe('1');
+    expect(probe.intl).toBeNull();
+    expect(probe.cnCfg).toBe(path.join(os.homedir(), '.qoder-cn'));
+    expect(probe.intlCfg).toBeNull();
+    expect(probe.others).toEqual([]);
+  });
+
+  it('国际版 bin 名子进程收到 QODER_MEMORY_HEADLESS 且无泄漏', async () => {
+    const result = await run('env-probe', { bin: namedFixture('qodercli'), memory: true });
+    expect(result.ok).toBe(true);
+    const probe = JSON.parse(result.text) as {
+      intl: string | null; cn: string | null; intlCfg: string | null; cnCfg: string | null; others: string[];
+    };
+    expect(probe.intl).toBe('1');
+    expect(probe.cn).toBeNull();
+    expect(probe.intlCfg).toBe(path.join(os.homedir(), '.qoder'));
+    expect(probe.cnCfg).toBeNull();
+    expect(probe.others).toEqual([]);
   });
 });
 
@@ -187,7 +285,7 @@ describe('runQoder 语义错误归类', () => {
 
     expect(result.errorClass).toBe('auth');
     expect(result.errorCode).toBe('authentication_failed');
-    expect(result.error).toBe('Qoder 凭据已失效：需在本机重新登录 qodercli 后重试。（退出码 1）');
+    expect(result.error).toBe('Qoder 凭据已失效：需在本机重新登录 Qoder CLI 后重试。（退出码 1）');
     expect(result.error).not.toContain('authentication_failed');
   });
 
@@ -196,7 +294,7 @@ describe('runQoder 语义错误归类', () => {
 
     expect(result.errorClass).toBe('unknown');
     expect(result.errorCode).toBe('rate_limit');
-    expect(result.error).toBe('执行失败：qodercli 异常退出（退出码 1）。详见本机日志。');
+    expect(result.error).toBe('执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。');
     expect(result.errorDetail).toBe('Rate limit exceeded, please slow down.');
   });
 
@@ -238,11 +336,11 @@ describe('runQoder 语义错误归类', () => {
 
     const empty = await run('empty');
     expect(empty.errorClass).toBe('unknown');
-    expect(empty.error).toBe('执行失败：qodercli 没有任何输出（退出码 0）。详见本机日志。');
+    expect(empty.error).toBe('执行失败：Qoder CLI 没有任何输出（退出码 0）。详见本机日志。');
 
     const parse = await run('parse');
     expect(parse.errorClass).toBe('unknown');
-    expect(parse.error).toBe('执行失败：qodercli 输出无法解析（退出码 0）。详见本机日志。');
+    expect(parse.error).toBe('执行失败：Qoder CLI 输出无法解析（退出码 0）。详见本机日志。');
   });
 
   it('应该在进程正常退出但 error_code 表明截断时仍判为失败', async () => {

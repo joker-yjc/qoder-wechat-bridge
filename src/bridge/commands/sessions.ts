@@ -4,6 +4,7 @@
  */
 import { SessionError, formatSessionList } from '../sessions.js';
 import type { CommandHandler } from './types.js';
+import { activeSession } from '../../config.js';
 
 /** /sessions 命令处理器（只读，不要求空闲） */
 export const sessionsCommand: CommandHandler = {
@@ -13,7 +14,7 @@ export const sessionsCommand: CommandHandler = {
     try {
       const catalog = ctx.deps.listSessions(ctx.config.qoderBin, ctx.workdir());
       ctx.catalogs.set(ctx.userId, catalog);
-      const activeId = ctx.state.sessions[ctx.userId]?.sessionId;
+      const activeId = activeSession(ctx.state, ctx.userId, ctx.config.qoderBin)?.sessionId;
       await ctx.reply(formatSessionList(catalog, activeId, ctx.config.sessionListLimit));
     } catch (err) {
       const reason = err instanceof SessionError ? err.message : '列出会话失败';

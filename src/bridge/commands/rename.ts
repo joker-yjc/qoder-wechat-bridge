@@ -4,6 +4,7 @@
  */
 import { SessionError, sessionNameError } from '../sessions.js';
 import type { CommandHandler } from './types.js';
+import { activeSession } from '../../config.js';
 
 /** /rename 命令处理器（变更类，要求空闲） */
 export const renameCommand: CommandHandler = {
@@ -12,7 +13,7 @@ export const renameCommand: CommandHandler = {
   requiresIdle: true,
   handle: async (ctx, text) => {
     const name = text.trim().slice('/rename'.length).trim();
-    const current = ctx.state.sessions[ctx.userId];
+    const current = activeSession(ctx.state, ctx.userId, ctx.config.qoderBin);
     if (!current) {
       await ctx.reply('当前没有会话，先发消息创建后再 /rename。');
       return true;

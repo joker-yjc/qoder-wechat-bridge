@@ -50,7 +50,7 @@ run 选项（仅本次运行生效，不写入配置文件）：
   --cwd <dir>                 Qoder 工作目录
   --permission-mode <mode>    default | accept_edits | dont_ask | bypass_permissions | auto
   --model <name>              指定模型
-  --qoder-bin <path>          qodercli 路径（默认 qodercli）
+  --qoder-bin <path>          Qoder CLI 命令名或路径（国际版 qodercli / CN qoderclicn，默认 qodercli）
   --owner <id>                唯一授权发送者 id
   --allow <id,id>             额外允许的发送者
   --timeout-ms <ms>           单任务超时

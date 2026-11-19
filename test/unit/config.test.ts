@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONFIG,
   DEFAULT_STATE,
+  activeSession,
   clearRunInfo,
   configDir,
   configPath,
@@ -386,5 +387,65 @@ describe('运行记录', () => {
 
     clearRunInfo(process.pid);
     expect(readRunInfo()).toBeNull();
+  });
+});
+
+describe('activeSession 后端过滤', () => {
+  /** 造含单个会话指针的状态 */
+  function stateWith(rec: { sessionId: string; updatedAt: number; turns: number; bin?: string }) {
+    const state = structuredClone(DEFAULT_STATE);
+    state.sessions.u1 = rec;
+    return state;
+  }
+  const record = { sessionId: 's1', updatedAt: 1, turns: 3 };
+
+  it('无记录返回 undefined', () => {
+    expect(activeSession(structuredClone(DEFAULT_STATE), 'u1', 'qodercli')).toBeUndefined();
+  });
+
+  it('bin 一致返回记录', () => {
+    const state = stateWith({ ...record, bin: 'qoderclicn' });
+    expect(activeSession(state, 'u1', 'qoderclicn')).toEqual({ ...record, bin: 'qoderclicn' });
+  });
+
+  it('跨后端 kind 返回 undefined', () => {
+    const state = stateWith({ ...record, bin: 'qodercli' });
+    expect(activeSession(state, 'u1', 'qoderclicn')).toBeUndefined();
+  });
+
+  it('存量缺 bin 视为国际版：当前 qodercli 可续接', () => {
+    expect(activeSession(stateWith(record), 'u1', 'qodercli')).toEqual(record);
+  });
+
+  it('存量缺 bin 视为国际版：当前 CN 不可续接', () => {
+    expect(activeSession(stateWith(record), 'u1', 'qoderclicn')).toBeUndefined();
+  });
+
+  it('同 kind 不同写法不误判（qodercli ↔ 绝对路径）', () => {
+    const state = stateWith({ ...record, bin: 'qodercli' });
+    expect(activeSession(state, 'u1', '/usr/local/bin/qodercli')).toEqual({ ...record, bin: 'qodercli' });
+  });
+
+  it('同 kind 不同写法不误判（qoderclicn ↔ qodercn dispatcher）', () => {
+    const state = stateWith({ ...record, bin: 'qoderclicn' });
+    expect(activeSession(state, 'u1', 'qodercn')).toEqual({ ...record, bin: 'qoderclicn' });
+  });
+
+  it('normalizeState 透传含 bin 与缺 bin 的会话指针', () => {
+    const raw = {
+      sessions: {
+        a: { sessionId: 'sa', updatedAt: 1, turns: 1, bin: 'qoderclicn' },
+        b: { sessionId: 'sb', updatedAt: 2, turns: 2 },
+      },
+    };
+    const state = normalizeState(raw);
+    expect(state.sessions.a.bin).toBe('qoderclicn');
+    expect(state.sessions.b.bin).toBeUndefined();
+  });
+
+  it('损坏的非字符串 bin 视为国际版且不抛错', () => {
+    const state = stateWith({ ...record, bin: 123 as unknown as string });
+    expect(activeSession(state, 'u1', 'qodercli')).toEqual({ ...record, bin: 123 });
+    expect(activeSession(state, 'u1', 'qoderclicn')).toBeUndefined();
   });
 });
