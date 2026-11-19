@@ -7,7 +7,7 @@
 | 项 | 要求 | 备注 |
 |---|---|---|
 | Node | `>= 20` | 低于 20 时用 `n 22` 或安装 LTS |
-| qodercli | `>= 1.1.80`，且已 `qodercli login` | 未登录时执行浏览器授权 |
+| Qoder CLI | 国际版 `qodercli` `>= 1.1.80` 或 CN 版 `qoderclicn`，且已登录（`qodercli login` / `qoderclicn login`） | 未登录时执行浏览器授权；后端切换见 §5.2 |
 | 微信 | `>= 8.0.69` | 官方 iLink 通道，仅单聊；建议先用小号验证 |
 
 如需切换 Node 版本：`n 22`。
@@ -108,8 +108,8 @@ node dist/cli.js run --permission-mode dont_ask
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `sdk_worker_removed` | 从 Qoder 桌面终端启动，继承了 `QODER_*` | 本包已在拉起 qodercli 时剥离；若仍出现，用 `.command` 从 Finder 启动 |
-| `Not logged in · Please run /login` | qodercli 未登录 | `qodercli login`，浏览器授权 |
+| `sdk_worker_removed` | 从 Qoder 桌面终端启动，继承了 `QODER_*` / `QODERCN_*` | 本包已在拉起 CLI 时剥离两个前缀；若仍出现，用 `.command` 从 Finder 启动 |
+| `Not logged in · Please run /login` | Qoder CLI 未登录 | 对应后端登录命令（国际版 `qodercli login` / CN `qoderclicn login`），浏览器授权 |
 | `SyntaxError: Invalid regular expression flags` | node 仍是 v16 | `n 22` |
 | 扫码后 `binded_redirect` | 该微信号已绑过其它 OpenClaw 形态机器人 | 先解绑，或换号 |
 | 收消息正常但回复失败 `ret=-2` | 下行额度耗尽 / context_token 失效 | 消息保留在 outbox，下一次入站优先补发；不计数、不隔离。连续出现时看 `status` 的额度告警 |
@@ -138,10 +138,10 @@ node dist/cli.js run --permission-mode dont_ask
 |---|---|---|---|
 | `model_quota` | `error_code=110`（数字）或 `error_message` 含 `Billing daily count exceeded` | `模型额度已用尽：…` | 稍后重试或 `/model` 换模型。实测 110 不是硬性全天封锁：2026-11-05 曾出现 23:21 失败、23:22 同模型成功 |
 | `output_limit` | `error_code="max_output_tokens"`，或 `stop_reason="max_tokens"` 且 `is_error=true` | `回答被截断：…` | `/model` 换输出上限更大的模型，或把任务拆小。BYOK 模型的思考 token 与正文共用额度时容易触发 |
-| `auth` | `error_code="authentication_failed"` | `Qoder 凭据已失效：…` | 本机执行 `qodercli login`；微信侧无入口 |
-| `unknown` | 以上都未命中 | 一期传输层文案（如 `执行失败：qodercli 异常退出（退出码 1）。详见本机日志。`）。**不参与去重**，每次都发完整提示 | 看日志 `未识别的 qodercli 语义错误` 里的 `errorCode` 与摘要，攒够样本再补规则 |
+| `auth` | `error_code="authentication_failed"` | `Qoder 凭据已失效：…` | 本机执行对应后端登录命令（国际版 `qodercli login` / CN `qoderclicn login`）；微信侧无入口 |
+| `unknown` | 以上都未命中 | 一期传输层文案（如 `执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。`）。**不参与去重**，每次都发完整提示 | 看日志 `未识别的 qodercli 语义错误` 里的 `errorCode` 与摘要，攒够样本再补规则 |
 
-传输层类别 `errorKind` 保持一期不变：`timeout` / `spawn` / `empty` / `parse` / `exit` / `is_error`。这四类里没有语义字段，`errorClass` 恒为 `unknown`，文案与 0.2.0 逐字一致。
+传输层类别 `errorKind` 保持一期不变：`timeout` / `spawn` / `empty` / `parse` / `exit` / `is_error`。这四类里没有语义字段，`errorClass` 恒为 `unknown`；用户文案已中性化为「Qoder CLI」（见 5.2），归类与截断口径与 0.2.0 一致。
 
 **两种"额度"不要混：**
 
@@ -151,6 +151,32 @@ node dist/cli.js run --permission-mode dont_ask
 | `quota`（下行额度） | 微信侧 `ret=-2`，一次入站约 10 条下行的额度 | `status` 的「下行额度」行、日志 `category=quota` |
 
 两者毫无关系，代码与文案里也刻意不共用名字。qodercli 上游枚举里还有 `billing_error` / `rate_limit` / `invalid_request` / `server_error`，目前**零实测样本**，一律落 `unknown` 并写告警日志，不做猜测性归类。
+
+### 5.2 后端切换（qodercli / qoderclicn）
+
+桥接支持国际版与 CN 版 CLI，`qoderBin` 是唯一切换开关（`QWB_QODER_BIN` / `--qoder-bin`）。后端画像由 bin 名纯函数推导，对照如下：
+
+| 项 | 国际版（`qodercli`） | CN 版（`qoderclicn` / `qodercn`） |
+|---|---|---|
+| 记忆开关 env | `QODER_MEMORY_HEADLESS` | `QODERCN_MEMORY_HEADLESS` |
+| 配置目录覆盖 env | `QODER_CONFIG_DIR` | `QODERCN_CONFIG_DIR` |
+| 用户配置目录 | `~/.qoder` | `~/.qoder-cn` |
+| 自定义模型来源 | `~/.qoder/settings.json` | `~/.qoder-cn/settings.json` |
+| 会话存储 | `~/.qoder/projects/…` | `~/.qoder-cn/projects/…` |
+| 登录凭据 | keychain `qoder-cli` | keychain `qoder-cli-cn`（独立，需 `qoderclicn login`） |
+
+配置目录覆盖变量**两版不同**（真机对照实测）：CN 只认 `QODERCN_CONFIG_DIR`、忽略 `QODER_CONFIG_DIR`，intl 相反；空串/空白视为未设置。桥接按后端解析覆盖目录（`resolveConfigDir`），并经 `cleanEnv` 把解析后的目录补回 CLI 子进程对应变量，保证 `/model` 列表与 CLI 实际可用模型一致。覆盖值建议用绝对路径；相对路径按桥接进程 cwd 解析为绝对（`path.resolve`），不展开 `~`。`cleanEnv` 剥离 `QODER_*` 与 `QODERCN_*` 两个前缀，再按后端补回记忆开关与配置目录。
+
+> **不支持 env 配置的 VPC/服务账号场景**：按需求 2.4，`cleanEnv` 剥离全部 `QODER_*` / `QODERCN_*`（含 VPC 端点、服务账号、客户端类型变量），仅补回记忆开关与配置目录。个人 OAuth 登录不受影响；若部署依赖这些 env 配置 CN VPC/服务账号，当前会被剥掉（需另做白名单透传，主人已确认无此依赖）。
+
+排查要点：
+
+- **确认当前后端**：微信发 `/status` 看「后端」行；启动日志 `桥接服务启动` 含 `qoderBin` / `backend` / `memoryEnv` / `configDir` 字段。
+- **CN 记忆没生效**：先看 bin 名是否标准（`qoderclicn` / `qodercn` 或绝对路径）。自定义 wrapper / 改名软链 / 直接指向 `bundle/qoderclicn.js` 都会回落国际版画像，导致设错开关——改用标准名或 `/usr/local/bin/qoderclicn` 这类绝对路径。
+- **设了覆盖变量但 `/model` 与 CLI 不一致**：确认用的是当前后端的变量（CN `QODERCN_CONFIG_DIR`，intl `QODER_CONFIG_DIR`）；设错后端的变量会被忽略。覆盖目录需含登录态，否则 CLI 报 auth。
+- **切换后第一条消息开了新会话**：属预期。会话指针带 `bin` 标签，跨后端（kind 不匹配）直接新建，不浪费失败续接往返；日志有 `后端已切换，旧会话指针不可续接`。旧会话内容仍在原 CLI 存储，切回后经 `/sessions` 找回。
+- **`/model` 列不出 CN 自定义模型**：确认 `~/.qoder-cn/settings.json` 的 `providers` 存在；缺失/损坏时自定义列表降级为空（内置模型仍在），不报错。
+- **CN 未登录**：`errorClass=auth`，本机执行 `qoderclicn login`；桌面端数据迁移不等于 CLI 已登录。
 
 ## 6. 观察与验收
 

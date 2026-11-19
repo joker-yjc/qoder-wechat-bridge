@@ -260,7 +260,7 @@ describe('processTask 正常链路', () => {
       .mockResolvedValueOnce({
         ok: false,
         text: '',
-        error: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。',
+        error: '执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。',
         errorDetail: 'session not found',
         errorKind: 'exit',
         durationMs: 1,
@@ -331,6 +331,54 @@ describe('processTask 正常链路', () => {
     await task;
 
     expect(sent).toContain('任务已停止。');
+  });
+});
+
+describe('processTask 后端切换', () => {
+  it('跨后端首条消息直接新建：不带 -r、turns 从 1、指针带新 bin', async () => {
+    const { runtime, state, runQoder } = makeRuntime({ qoderBin: 'qoderclicn' });
+    state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 5, bin: 'qodercli' };
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(runQoder).toHaveBeenCalledTimes(1);
+    expect(runQoder.mock.calls[0][0].sessionId).toBeUndefined();
+    expect(state.sessions.u).toEqual(
+      expect.objectContaining({ sessionId: 's1', turns: 1, bin: 'qoderclicn' }),
+    );
+  });
+
+  it('同后端续接不变：带旧 id、turns 累加', async () => {
+    const { runtime, state, runQoder } = makeRuntime({ qoderBin: 'qoderclicn' });
+    state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 5, bin: 'qoderclicn' };
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(runQoder.mock.calls[0][0].sessionId).toBe('s0');
+    expect(state.sessions.u?.turns).toBe(6);
+    expect(state.sessions.u?.bin).toBe('qoderclicn');
+  });
+
+  it('存量缺 bin 指针在国际版下正常续接并补写 bin', async () => {
+    const { runtime, state, runQoder } = makeRuntime();
+    state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 5 };
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(runQoder.mock.calls[0][0].sessionId).toBe('s0');
+    expect(state.sessions.u?.turns).toBe(6);
+    expect(state.sessions.u?.bin).toBe('qodercli');
+  });
+
+  it('存量缺 bin 指针在 CN 下视为跨后端新建', async () => {
+    const { runtime, state, runQoder } = makeRuntime({ qoderBin: 'qoderclicn' });
+    state.sessions.u = { sessionId: 's0', updatedAt: 0, turns: 5 };
+
+    await runtime.processTask('u', 'hello', 'ctx');
+
+    expect(runQoder.mock.calls[0][0].sessionId).toBeUndefined();
+    expect(state.sessions.u?.turns).toBe(1);
+    expect(state.sessions.u?.bin).toBe('qoderclicn');
   });
 });
 
@@ -452,7 +500,7 @@ describe('错误提示语义与去重', () => {
       semanticFailure({
         errorClass: 'unknown',
         errorCode: 'rate_limit',
-        error: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。',
+        error: '执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。',
         errorDetail: 'Rate limit exceeded, please slow down.',
       }),
     );
@@ -525,7 +573,7 @@ describe('错误提示语义与去重', () => {
         semanticFailure({
           errorClass: 'unknown',
           errorCode: undefined,
-          error: '执行失败：无法启动 qodercli。请检查 QWB_QODER_BIN，详见本机日志。',
+          error: '执行失败：无法启动 Qoder CLI。请检查 QWB_QODER_BIN，详见本机日志。',
           errorDetail: undefined,
           errorKind: 'spawn',
         }),
@@ -534,7 +582,7 @@ describe('错误提示语义与去重', () => {
         semanticFailure({
           errorClass: 'unknown',
           errorCode: 'rate_limit',
-          error: '执行失败：qodercli 异常退出（退出码 1）。详见本机日志。',
+          error: '执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。',
           errorDetail: 'Rate limit exceeded',
         }),
       );
@@ -542,8 +590,8 @@ describe('错误提示语义与去重', () => {
     await runtime.processTask('u', 'hello', 'ctx');
     await runtime.processTask('u', 'hello', 'ctx');
 
-    expect(sent[0]).toContain('无法启动 qodercli');
-    expect(sent[1]).toBe('执行失败：qodercli 异常退出（退出码 1）。详见本机日志。');
+    expect(sent[0]).toContain('无法启动 Qoder CLI');
+    expect(sent[1]).toBe('执行失败：Qoder CLI 异常退出（退出码 1）。详见本机日志。');
   });
 
   it('应该在 unknown 被抑制时不写抑制日志', async () => {

@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ERROR_CODE_MAX_CHARS, sanitizeSingleLine, type QoderErrorClass } from './bridge/error-class.js';
+import { backendProfile } from './bridge/backend.js';
 
 /** 包名，用于目录名 */
 const APP = 'qoder-wechat-bridge';
@@ -249,6 +250,25 @@ export interface SessionRecord {
   sessionId: string;
   updatedAt: number;
   turns: number;
+  /** 创建/续接该会话时的后端 bin；存量记录无此字段，视为 DEFAULT_CONFIG.qoderBin（国际版） */
+  bin?: string;
+}
+
+/**
+ * 取当前后端下的活动会话指针；跨后端（kind 不匹配）返回 undefined
+ * 按后端 kind 比较而非原始字符串：同后端不同写法（命令名 ↔ 绝对路径、主程序 ↔ dispatcher）共享会话存储，不应误丢续接
+ * @param state - 运行状态
+ * @param userId - 微信用户 id
+ * @param bin - 当前配置的后端 bin
+ * @returns 可续接的指针；无记录或跨后端时 undefined
+ */
+export function activeSession(state: State, userId: string, bin: string): SessionRecord | undefined {
+  const record = state.sessions[userId];
+  if (!record) return undefined;
+  // 手改/损坏的 state 可能把 bin 写成非字符串；收窄后再推导，避免 path.basename 抛错
+  const recordBin =
+    typeof record.bin === 'string' && record.bin.trim() ? record.bin : DEFAULT_CONFIG.qoderBin;
+  return backendProfile(recordBin).kind === backendProfile(bin).kind ? record : undefined;
 }
 
 /** 出站消息类别 */

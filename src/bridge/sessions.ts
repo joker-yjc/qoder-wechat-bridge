@@ -93,7 +93,7 @@ export function parseSessionList(stdout: string): SessionEntry[] {
   // 仅当存在疑似会话行（含方括号 id）却全部无法解析时才判格式异常；
   // 空清单哨兵/普通提示行不含 id，视为空清单，不报错（P0-1）
   if (suspect > 0 && entries.length === 0) {
-    throw new SessionError('parse', '会话清单格式异常，请升级 qodercli');
+    throw new SessionError('parse', '会话清单格式异常，请升级 Qoder CLI');
   }
   return entries;
 }
@@ -109,7 +109,7 @@ export function listSessions(bin: string, cwd: string): SessionEntry[] {
   let out: string;
   try {
     out = execFileSync(bin, ['--list-sessions'], {
-      env: cleanEnv(),
+      env: cleanEnv({ bin }),
       cwd,
       encoding: 'utf-8',
       timeout: SESSION_LIST_TIMEOUT_MS,
@@ -124,7 +124,7 @@ export function listSessions(bin: string, cwd: string): SessionEntry[] {
     }
     if (e.code === 'ENOENT') {
       // ENOENT 可能是 qodercli 未安装，也可能是 cwd 不存在（Minor-7），不单一归因安装
-      throw new SessionError('not_installed', '无法列出会话：qodercli 未安装或工作目录不存在');
+      throw new SessionError('not_installed', '无法列出会话：Qoder CLI 未安装或工作目录不存在');
     }
     throw new SessionError('spawn', '列出会话失败，请稍后重试');
   }
@@ -222,7 +222,7 @@ export function renameSession(input: {
   return new Promise((resolve) => {
     const child = spawn(input.bin, args, {
       cwd: input.cwd,
-      env: cleanEnv(),
+      env: cleanEnv({ bin: input.bin }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -247,7 +247,7 @@ export function renameSession(input: {
       if (stdout.length < 1024 * 1024) stdout += buf.toString('utf-8');
     });
     child.on('error', () => {
-      done({ ok: false, error: '无法启动 qodercli' });
+      done({ ok: false, error: '无法启动 Qoder CLI' });
     });
     child.on('close', (code) => {
       if (timedOut) {
@@ -287,7 +287,7 @@ export function deleteSession(input: {
   return new Promise((resolve) => {
     const child = spawn(input.bin, args, {
       cwd: input.cwd,
-      env: cleanEnv(),
+      env: cleanEnv({ bin: input.bin }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -311,7 +311,7 @@ export function deleteSession(input: {
       if (stdout.length < 1024 * 1024) stdout += buf.toString('utf-8');
     });
     child.on('error', () => {
-      done({ ok: false, error: '无法启动 qodercli' });
+      done({ ok: false, error: '无法启动 Qoder CLI' });
     });
     child.on('close', () => {
       if (timedOut) {

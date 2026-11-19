@@ -225,7 +225,7 @@ qoder-wechat status                                              # 登录状态
 
 **刚重启过，那条消息没回？** 停服时正在下载附件或还在队列里排着的消息会被丢弃，微信侧也不会再投第二次，这是为了避免两个实例同时写状态。让对方重发一次即可。
 
-**回复"执行失败：Not logged in"？** Qoder CLI 没登录，执行 `qodercli login`。
+**回复"执行失败：Not logged in"？** Qoder CLI 没登录，在本机执行对应后端的登录命令：国际版 `qodercli login`，CN 版 `qoderclicn login`。
 
 **报 `sdk_worker_removed`？** 你是在 Qoder 桌面版的终端里启动的，继承了它的环境变量。本工具会自动剥离；如果仍出现，换用系统「终端」App 启动。
 
@@ -239,7 +239,7 @@ qoder-wechat status                                              # 登录状态
 |---|---|---|
 | `模型额度已用尽：…` | qodercli 报 `error_code=110`（当日调用次数到上限） | 稍后重试，或发 `/model` 换个模型 |
 | `回答被截断：…` | 模型输出达到上限，本轮没有完整结果 | 发 `/model` 换输出上限更大的模型，或把任务拆小 |
-| `Qoder 凭据已失效：…` | qodercli 登录态失效 | 在**本机**执行 `qodercli login`（微信侧没有入口） |
+| `Qoder 凭据已失效：…` | Qoder CLI 登录态失效 | 在**本机**执行对应后端登录命令（国际版 `qodercli login` / CN `qoderclicn login`；微信侧没有入口） |
 | `执行失败：…（退出码 N）` | 传输层失败或未收录的错误码 | 看本机日志与诊断文件 |
 
 完整的 stdout / stderr 写到 `~/.local/state/qoder-wechat-bridge/logs/diagnostics/YYYY-MM-DD/`（单文件 ≤64KB，保留 7 天，含 `errorClass` / `errorCode` 两行便于排查），不会把源码或几百 KB 文本发到微信。
@@ -317,9 +317,9 @@ qoder-wechat notify "构建完成，有 3 个测试失败，需要你确认是�
 |---|---|---|---|
 | `cwd` | `QWB_CWD` | 空（全局） | 工作目录；留空表示不限定 |
 | `permissionMode` | `QWB_PERMISSION_MODE` | `dont_ask` | `default` / `accept_edits` / `dont_ask` / `bypass_permissions` / `auto` |
-| `qoderBin` | `QWB_QODER_BIN` | `qodercli` | CLI 路径 |
+| `qoderBin` | `QWB_QODER_BIN` | `qodercli` | CLI 命令名或路径；国际版 `qodercli`，CN 版 `qoderclicn`（或 dispatcher `qodercn`），详见「切换 Qoder CN」 |
 | `qoderModel` | `QWB_MODEL` | 空 | 默认模型 |
-| `memoryEnabled` | `QWB_MEMORY` | `true` | 是否加载 Qoder 长期记忆（`QODER_MEMORY_HEADLESS`） |
+| `memoryEnabled` | `QWB_MEMORY` | `true` | 是否加载 Qoder 长期记忆（国际版 `QODER_MEMORY_HEADLESS`，CN 版 `QODERCN_MEMORY_HEADLESS`，按后端自动选择） |
 | `personaFile` | `QWB_PERSONA_FILE` | `~/.config/qoder-wechat-bridge/persona.md` | 人设文件；存在时作为 `--append-system-prompt` |
 | `inboxDir` | `QWB_INBOX_DIR` | `~/.local/state/qoder-wechat-bridge/inbox` | 入站附件目录，可指向磁盘更宽裕的位置 |
 | `ownerUserId` | `QWB_OWNER_ID` | 登录时写入 | 唯一授权发送者 |
@@ -342,7 +342,27 @@ qoder-wechat notify "构建完成，有 3 个测试失败，需要你确认是�
 
 模型切换细节：内置模型直接写名字（如 `GLM-5.3`）；自定义 provider 的模型必须写成 `<providerId>/<model>`，否则 Qoder 会静默回落到 `auto`。`/model` 命令已处理这层映射。
 
-**记忆**：开启 `memoryEnabled` 后，headless 会话会读取 Qoder 的长期记忆（`~/.qoder/memory/MEMORY.md` 与当前工作目录对应的项目记忆），你在桌面端积累的偏好、项目背景会带进微信任务里。实现上只是给 `qodercli` 补回 `QODER_MEMORY_HEADLESS=1`——桥接为了避免 `sdk_worker_removed` 会剥离所有 `QODER_*`，唯独这个开关需要保留。关闭用 `QWB_MEMORY=0`。
+**记忆**：开启 `memoryEnabled` 后，headless 会话会读取 Qoder 的长期记忆（国际版 `~/.qoder/memory/MEMORY.md`、CN 版 `~/.qoder-cn/memory/MEMORY.md`，及当前工作目录对应的项目记忆），你在桌面端积累的偏好、项目背景会带进微信任务里。实现上只是给 CLI 补回记忆开关——桥接为了避免 `sdk_worker_removed` 会剥离所有 `QODER_*` 与 `QODERCN_*`，唯独按后端补回对应开关（国际版 `QODER_MEMORY_HEADLESS=1`，CN 版 `QODERCN_MEMORY_HEADLESS=1`）。关闭用 `QWB_MEMORY=0`。
+
+**切换 Qoder CN**：桥接同时支持国际版 `qodercli` 与 CN 版 `qoderclicn`，切换只改 `qoderBin` 一个配置项：
+
+1. 安装 CN CLI：`npm install -g @qodercn-ai/qoderclicn`（注意是 `@qodercn-ai`  scope；npm 上的 `@qoder-ai/qoderclicn@0.0.1` 疑似抢注包，勿装）。
+2. 登录 CN CLI：`qoderclicn login`（CN 凭据独立于国际版，桌面端迁移不等于 CLI 已登录）。
+3. 改配置：`config.json` 里 `qoderBin` 设为 `qoderclicn`，或环境变量 `QWB_QODER_BIN=qoderclicn`，或启动旗标 `--qoder-bin qoderclicn`。重启桥接生效，`/status` 的「后端」行可确认。
+
+切换后桥接自动用对 CN 的记忆开关（`QODERCN_MEMORY_HEADLESS`）与自定义模型目录（`~/.qoder-cn/settings.json`）。若要迁移配置目录，覆盖变量也按后端区分：CN 设 `QODERCN_CONFIG_DIR`、国际版设 `QODER_CONFIG_DIR`（设错后端的变量会被忽略）；桥接会把解析后的目录同步给 CLI 子进程，保证 `/model` 列表与 CLI 实际可用模型一致。每个用户切换后的第一条消息会直接开新会话（旧国际版会话 id 在 CN 存储里不存在），不浪费一次失败往返；切回 `qodercli` 一切如旧，旧会话仍在 CLI 侧，可经 `/sessions` 找回。
+
+> bin 名须为 `qodercli` / `qoderclicn` / `qodercn` 之一，或指向它们的绝对路径（如 `/usr/local/bin/qoderclicn`）。其它名字（自定义 wrapper、改名软链）会回落国际版画像，CN 记忆开关会设错——此时请改用上述标准名或绝对路径。
+
+launchd 常驻可在 plist 的 `EnvironmentVariables` 里加 `QWB_QODER_BIN` 切换后端。**建议用绝对路径**：launchd 默认 PATH 通常不含 `/usr/local/bin`，按名调用可能 ENOENT（用 `which qoderclicn` 查你的实际路径）；若坚持按名，需同时在 plist 里设置含该目录的 `PATH`。示例：
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>QWB_QODER_BIN</key>
+  <string>/usr/local/bin/qoderclicn</string>
+</dict>
+```
 
 **人设（persona）**：把人设写进 `~/.config/qoder-wechat-bridge/persona.md`，每条任务会读取它并作为 `--append-system-prompt` 追加到 Qoder 默认提示后——工具、skill、记忆的说明都保留，只增加你的风格约束。改完保存，下一条微信消息就生效，不用重启。文件上限 8KB。
 

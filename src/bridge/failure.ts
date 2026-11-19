@@ -86,7 +86,7 @@ export function buildUserErrorReply(input: {
         input.maxChars,
       );
     case 'auth':
-      return fit(`Qoder 凭据已失效：需在本机重新登录 qodercli 后重试。（退出码 ${code}）`, input.maxChars);
+      return fit(`Qoder 凭据已失效：需在本机重新登录 Qoder CLI 后重试。（退出码 ${code}）`, input.maxChars);
   }
 
   switch (input.kind) {
@@ -96,24 +96,24 @@ export function buildUserErrorReply(input: {
     case 'spawn': {
       const reason = firstLine(input.detail, 120);
       text = reason
-        ? `执行失败：无法启动 qodercli（${reason}）。请检查 QWB_QODER_BIN，详见本机日志。`
-        : '执行失败：无法启动 qodercli。请检查 QWB_QODER_BIN，详见本机日志。';
+        ? `执行失败：无法启动 Qoder CLI（${reason}）。请检查 QWB_QODER_BIN，详见本机日志。`
+        : '执行失败：无法启动 Qoder CLI。请检查 QWB_QODER_BIN，详见本机日志。';
       break;
     }
     case 'empty':
-      text = `执行失败：qodercli 没有任何输出（退出码 ${code}）。详见本机日志。`;
+      text = `执行失败：Qoder CLI 没有任何输出（退出码 ${code}）。详见本机日志。`;
       break;
     case 'parse':
-      text = `执行失败：qodercli 输出无法解析（退出码 ${code}）。详见本机日志。`;
+      text = `执行失败：Qoder CLI 输出无法解析（退出码 ${code}）。详见本机日志。`;
       break;
     case 'exit':
-      text = `执行失败：qodercli 异常退出（退出码 ${code}）。详见本机日志。`;
+      text = `执行失败：Qoder CLI 异常退出（退出码 ${code}）。详见本机日志。`;
       break;
     case 'is_error': {
       const reason = firstLine(input.detail, 200);
       text = reason
         ? `执行失败：${reason}（退出码 ${code}）`
-        : `执行失败：qodercli 返回错误（退出码 ${code}）。详见本机日志。`;
+        : `执行失败：Qoder CLI 返回错误（退出码 ${code}）。详见本机日志。`;
       break;
     }
   }

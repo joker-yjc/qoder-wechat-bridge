@@ -23,12 +23,16 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'qwb-startup-'));
   process.env.QWB_CONFIG_DIR = path.join(root, 'config');
   process.env.QWB_STATE_DIR = path.join(root, 'state');
+  delete process.env.QODER_CONFIG_DIR;
+  delete process.env.QODERCN_CONFIG_DIR;
   ensureDirs();
 });
 
 afterEach(() => {
   delete process.env.QWB_CONFIG_DIR;
   delete process.env.QWB_STATE_DIR;
+  delete process.env.QODER_CONFIG_DIR;
+  delete process.env.QODERCN_CONFIG_DIR;
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -110,6 +114,47 @@ describe('runService 启动流程', () => {
     expect(deps.notifyClient).toHaveBeenCalledWith(expect.objectContaining({ action: 'start' }));
     expect(deps.notifyClient).toHaveBeenCalledWith(expect.objectContaining({ action: 'stop' }));
     expect(deps.clearRunInfo).toHaveBeenCalledWith(process.pid);
+  });
+
+  it('启动日志应该记录后端 bin 与画像', async () => {
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    const handle = await runService({ ...makeConfig(), qoderBin: 'qoderclicn' }, makeDeps());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    handle.stop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const calls = info.mock.calls.slice();
+    info.mockRestore();
+
+    expect(calls).toContainEqual([
+      '桥接服务启动',
+      expect.objectContaining({
+        qoderBin: 'qoderclicn',
+        backend: 'cn',
+        memoryEnv: 'QODERCN_MEMORY_HEADLESS',
+        configDir: expect.stringContaining('.qoder-cn'),
+      }),
+    ]);
+  });
+
+  it('预检失败日志应该记录实际 bin 与失败 detail', async () => {
+    const error = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+    const handle = await runService(
+      { ...makeConfig(), qoderBin: 'qoderclicn' },
+      makeDeps({ runPreflight: vi.fn(async () => failPreflight) }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    handle.stop();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const calls = error.mock.calls.slice();
+    error.mockRestore();
+
+    expect(calls).toContainEqual([
+      '启动预检失败',
+      expect.objectContaining({
+        qoderBin: 'qoderclicn',
+        details: expect.stringContaining('not found'),
+      }),
+    ]);
   });
 
   it('应该在预检失败且存在 token 时发送一条短告警', async () => {
@@ -290,9 +335,15 @@ describe('runService 启动流程', () => {
 
 describe('formatPreflightAlert', () => {
   it('应该生成不超过 300 字的短告警', () => {
-    const text = formatPreflightAlert(failPreflight);
+    const text = formatPreflightAlert(failPreflight, 'qodercli');
     expect(text).toContain('qoder_missing');
     expect(text.length).toBeLessThanOrEqual(300);
+  });
+
+  it('告警应该含实际配置的后端 bin（CN 不写死 qodercli）', () => {
+    const text = formatPreflightAlert(failPreflight, 'qoderclicn');
+    expect(text).toContain('Node / qoderclicn');
+    expect(text).not.toContain('Node / qodercli。');
   });
 });
 

@@ -4,10 +4,10 @@
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { log } from './log.js';
 import { cleanEnv } from './bridge/qoder.js';
+import { resolveConfigDir } from './bridge/backend.js';
 
 /** 一个可选模型 */
 export interface ModelOption {
@@ -19,11 +19,6 @@ export interface ModelOption {
   custom: boolean;
 }
 
-/** Qoder 配置目录 */
-function qoderConfigDir(): string {
-  return process.env.QODER_CONFIG_DIR ?? path.join(os.homedir(), '.qoder');
-}
-
 /**
  * 解析 `qodercli --list-models` 的内置模型
  * 自定义模型在该输出里会被截断，这里只取不含括号的行
@@ -33,7 +28,7 @@ function qoderConfigDir(): string {
 function listBuiltinModels(bin: string): ModelOption[] {
   try {
     const out = execFileSync(bin, ['--list-models'], {
-      env: cleanEnv(),
+      env: cleanEnv({ bin }),
       encoding: 'utf-8',
       timeout: 20_000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -55,11 +50,12 @@ function listBuiltinModels(bin: string): ModelOption[] {
  * 从 Qoder 配置文件读取自定义 provider 下的模型
  * 结构（非公开契约，按当前版本解析，失败即降级）：
  * providers.<providerId>.models[].model / displayName
+ * @param bin - 当前后端 bin，决定默认配置目录
  * @returns 自定义模型列表
  */
-function listCustomModels(): ModelOption[] {
+function listCustomModels(bin: string): ModelOption[] {
   try {
-    const settingsPath = path.join(qoderConfigDir(), 'settings.json');
+    const settingsPath = path.join(resolveConfigDir(bin), 'settings.json');
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) as {
       providers?: Record<string, { models?: Array<{ model?: string; displayName?: string }> }>;
     };
@@ -85,6 +81,11 @@ function listCustomModels(): ModelOption[] {
 let cache: { bin: string; at: number; options: ModelOption[] } | null = null;
 const CACHE_TTL_MS = 5 * 60_000;
 
+/** 清空模型目录缓存（仅供测试隔离使用） */
+export function clearModelCache(): void {
+  cache = null;
+}
+
 /**
  * 汇总可选模型
  * @param bin - qodercli 路径
@@ -93,7 +94,7 @@ const CACHE_TTL_MS = 5 * 60_000;
 export function listModels(bin: string): ModelOption[] {
   if (cache && cache.bin === bin && Date.now() - cache.at < CACHE_TTL_MS) return cache.options;
   const seen = new Set<string>();
-  const all = [...listBuiltinModels(bin), ...listCustomModels()];
+  const all = [...listBuiltinModels(bin), ...listCustomModels(bin)];
   const options = all.filter((option) => {
     const key = option.id.toLowerCase();
     if (seen.has(key)) return false;

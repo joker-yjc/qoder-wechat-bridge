@@ -402,3 +402,42 @@ describe('/delete 两步确认', () => {
     expect(ctx.pendingDeletes.has('u1')).toBe(false);
   });
 });
+
+describe('命令处理器后端适配', () => {
+  /** CN 后端上下文 */
+  function cnCtx() {
+    return makeCtx({ config: { ...DEFAULT_CONFIG, qoderBin: 'qoderclicn' } });
+  }
+
+  it('/switch 写指针应该带当前 bin', async () => {
+    const { ctx } = cnCtx();
+    ctx.catalogs.set('u1', CATALOG);
+    expect(await dispatchCommand(ctx, '/switch 1')).toBe(true);
+    expect(ctx.state.sessions.u1?.bin).toBe('qoderclicn');
+    expect(ctx.state.sessions.u1?.sessionId).toBe(UUID1);
+  });
+
+  it('/switch 跨后端旧指针 turns 不串后端', async () => {
+    const { ctx } = cnCtx();
+    ctx.state.sessions.u1 = { sessionId: 'old', updatedAt: 1, turns: 9, bin: 'qodercli' };
+    ctx.catalogs.set('u1', CATALOG);
+    expect(await dispatchCommand(ctx, '/switch 1')).toBe(true);
+    expect(ctx.state.sessions.u1?.turns).toBe(0);
+    expect(ctx.state.sessions.u1?.bin).toBe('qoderclicn');
+  });
+
+  it('/rename 跨后端旧指针应该提示当前没有会话且不调 CLI', async () => {
+    const { ctx, replies } = cnCtx();
+    ctx.state.sessions.u1 = { sessionId: 'old', updatedAt: 1, turns: 1, bin: 'qodercli' };
+    expect(await dispatchCommand(ctx, '/rename 新名')).toBe(true);
+    expect(replies[0]).toContain('当前没有会话');
+    expect(ctx.deps.renameSession).not.toHaveBeenCalled();
+  });
+
+  it('/sessions 跨后端旧指针不标当前', async () => {
+    const { ctx, replies } = cnCtx();
+    ctx.state.sessions.u1 = { sessionId: UUID1, updatedAt: 1, turns: 1, bin: 'qodercli' };
+    expect(await dispatchCommand(ctx, '/sessions')).toBe(true);
+    expect(replies[0]).not.toContain('← 当前');
+  });
+});
